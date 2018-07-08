@@ -120,7 +120,8 @@ sourceFromFoldable n = S.fromFoldable [n..n+value]
 
 {-# INLINE sourceFromFoldableM #-}
 sourceFromFoldableM :: (S.IsStream t, S.MonadAsync m) => Int -> t m Int
-sourceFromFoldableM n = S.fromFoldableM (Prelude.fmap return [n..n+value])
+sourceFromFoldableM n = -- S.maxRate 1 $
+    S.fromFoldableM (Prelude.fmap return [n..n+value])
 
 {-# INLINE sourceFoldMapWith #-}
 sourceFoldMapWith :: (S.IsStream t, S.Semigroup (t m Int))

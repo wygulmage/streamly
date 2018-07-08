@@ -4,6 +4,7 @@
 {-# LANGUAGE FlexibleInstances         #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving#-}
 {-# LANGUAGE InstanceSigs              #-}
+{-# LANGUAGE LambdaCase                #-}
 {-# LANGUAGE MultiParamTypeClasses     #-}
 {-# LANGUAGE StandaloneDeriving        #-}
 {-# LANGUAGE UndecidableInstances      #-} -- XXX
@@ -44,7 +45,7 @@ import Control.Monad.IO.Class (MonadIO(..))
 import Control.Monad.Reader.Class (MonadReader(..))
 import Control.Monad.State.Class (MonadState(..))
 import Control.Monad.Trans.Class (MonadTrans(lift))
-import Data.Concurrent.Queue.MichaelScott (LinkedQueue, newQ, nullQ)
+import Data.Concurrent.Queue.MichaelScott (LinkedQueue, newQ, nullQ, tryPopR)
 import Data.IORef (IORef, newIORef, readIORef)
 import Data.Maybe (fromJust)
 import Data.Semigroup (Semigroup(..))
@@ -64,45 +65,63 @@ import qualified Streamly.Streams.StreamK as K
 -- Async
 -------------------------------------------------------------------------------
 
-{-# INLINE runStreamLIFO #-}
-runStreamLIFO :: MonadIO m
-    => State Stream m a -> IORef [Stream m a] -> Stream m a -> m () -> m ()
-runStreamLIFO st q m stop = unStream m st stop single yieldk
+{-# INLINE workLoopLIFO #-}
+workLoopLIFO :: MonadIO m
+    => IORef [Stream m a] -> State Stream m a -> SVar Stream m a -> WorkerInfo -> m ()
+workLoopLIFO q st sv winfo = run
+
     where
-    sv = fromJust $ streamVar st
-    maxBuf = bufferHigh st
+
+    run = do
+        work <- dequeue
+        case work of
+            Nothing -> liftIO $ sendStop sv winfo
+            Just m -> unStream m st run single yieldk
+
     single a = do
-        res <- liftIO $ sendYield maxBuf sv (ChildYield a)
-        if res then stop else liftIO $ sendStop sv
+        res <- liftIO $ sendYield sv winfo (ChildYield a)
+        if res then run else liftIO $ sendStop sv winfo
+
     yieldk a r = do
-        res <- liftIO $ sendYield maxBuf sv (ChildYield a)
+        res <- liftIO $ sendYield sv winfo (ChildYield a)
         if res
-        then (unStream r) st stop single yieldk
-        else liftIO $ enqueueLIFO sv q r >> sendStop sv
+        then unStream r st run single yieldk
+        else liftIO $ enqueueLIFO sv q r >> sendStop sv winfo
+
+    dequeue = liftIO $ atomicModifyIORefCAS q $ \case
+                [] -> ([], Nothing)
+                x : xs -> (xs, Just x)
 
 -------------------------------------------------------------------------------
 -- WAsync
 -------------------------------------------------------------------------------
 
-{-# INLINE runStreamFIFO #-}
-runStreamFIFO
+{-# INLINE workLoopFIFO #-}
+workLoopFIFO
     :: MonadIO m
-    => State Stream m a
-    -> LinkedQueue (Stream m a)
-    -> Stream m a
+    => LinkedQueue (Stream m a)
+    -> State Stream m a
+    -> SVar Stream m a
+    -> WorkerInfo
     -> m ()
-    -> m ()
-runStreamFIFO st q m stop = unStream m st stop single yieldk
+workLoopFIFO q st sv winfo = run
+
     where
-    sv = fromJust $ streamVar st
-    maxBuf = bufferHigh st
+
+    run = do
+        work <- liftIO $ tryPopR q
+        case work of
+            Nothing -> liftIO $ sendStop sv winfo
+            Just m -> unStream m st run single yieldk
+
     single a = do
-        res <- liftIO $ sendYield maxBuf sv (ChildYield a)
-        if res then stop else liftIO $ sendStop sv
+        res <- liftIO $ sendYield sv winfo (ChildYield a)
+        if res then run else liftIO $ sendStop sv winfo
+
     yieldk a r = do
-        res <- liftIO $ sendYield maxBuf sv (ChildYield a)
+        res <- liftIO $ sendYield sv winfo (ChildYield a)
         liftIO (enqueueFIFO sv q r)
-        if res then stop else liftIO $ sendStop sv
+        if res then run else liftIO $ sendStop sv winfo
 
 -------------------------------------------------------------------------------
 -- SVar creation
@@ -124,6 +143,18 @@ getLifoSVar st = do
     yl <- case yieldLimit st of
             Nothing -> return Nothing
             Just x -> Just <$> newIORef x
+    let pacedMode = maxStreamRate st > 0
+    (eyl, cyl, lyl, paceInfo) <-
+        if pacedMode
+        then do
+            let eyl = round $ 1.0e9 / (maxStreamRate st)
+            cyl <- newIORef (0,0)
+            lyl <- newIORef 0
+            paceInfo <- newIORef $ FastWorker 0
+            return (Just eyl, Just cyl, Just lyl, Just paceInfo)
+        else return (Nothing, Nothing, Nothing, Nothing)
+    wlp <- newIORef $ if pacedMode then 10000 else 0
+
 #ifdef DIAGNOSTICS
     disp <- newIORef 0
     maxWrk <- newIORef 0
@@ -135,12 +166,27 @@ getLifoSVar st = do
     let sv =
             SVar { outputQueue      = outQ
                  , maxYieldLimit    = yl
+                 , maxBufferLimit   = bufferHigh st
+                 , expectedYieldLatency = eyl
+                 , workerBootstrapLatency = Just $ workerLatency st
+                 , workerLatencyPeriod = wlp
+                 , workerMeasuredLatency = lyl
+                 , workerCurrentLatency = cyl
+                 , workerPacingInfo = paceInfo
                  , outputDoorBell   = outQMv
-                 , readOutputQ      = readOutputQBounded (threadsHigh st) sv
-                 , postProcess      = postProcessBounded sv
+                 , readOutputQ      =
+                        if pacedMode
+                        then readOutputQPaced (threadsHigh st) sv
+                        else readOutputQBounded (threadsHigh st) sv
+                 , postProcess      =
+                        if pacedMode
+                        then postProcessPaced sv
+                        else postProcessBounded sv
                  , workerThreads    = running
-                 , workLoop         = workLoopLIFO runStreamLIFO
-                                         st{streamVar = Just sv} q
+                 -- , workLoop         = workLoopLIFO runStreamLIFO
+                                         -- st{streamVar = Just sv} q
+                 --, workLoop         = workLoopLIFO runStreamLIFO q st{streamVar = Just sv} sv
+                 , workLoop         = workLoopLIFO q st{streamVar = Just sv} sv
                  , enqueue          = enqueueLIFO sv q
                  , isWorkDone       = checkEmpty
                  , needDoorBell     = wfw
@@ -170,6 +216,18 @@ getFifoSVar st = do
     yl <- case yieldLimit st of
             Nothing -> return Nothing
             Just x -> Just <$> newIORef x
+    let pacedMode = maxStreamRate st > 0
+    (eyl, cyl, lyl, paceInfo) <-
+        if pacedMode
+        then do
+            let eyl = round $ 1.0e9 / (maxStreamRate st)
+            cyl <- newIORef (0,0)
+            lyl <- newIORef 0
+            paceInfo <- newIORef $ FastWorker 0
+            return (Just eyl, Just cyl, Just lyl, Just paceInfo)
+        else return (Nothing, Nothing, Nothing, Nothing)
+    wlp <- newIORef $ if pacedMode then 1000 else 0
+
 #ifdef DIAGNOSTICS
     disp <- newIORef 0
     maxWrk <- newIORef 0
@@ -180,12 +238,24 @@ getFifoSVar st = do
     let sv =
            SVar { outputQueue      = outQ
                 , maxYieldLimit    = yl
+                , maxBufferLimit   = bufferHigh st
+                , expectedYieldLatency = eyl
+                , workerBootstrapLatency = Just $ workerLatency st
+                , workerLatencyPeriod = wlp
+                , workerMeasuredLatency = lyl
+                , workerCurrentLatency = cyl
+                , workerPacingInfo = paceInfo
                 , outputDoorBell   = outQMv
-                , readOutputQ      = readOutputQBounded (threadsHigh st) sv
-                , postProcess      = postProcessBounded sv
+                , readOutputQ      =
+                        if pacedMode
+                        then readOutputQPaced (threadsHigh st) sv
+                        else readOutputQBounded (threadsHigh st) sv
+                , postProcess      =
+                        if pacedMode
+                        then postProcessPaced sv
+                        else postProcessBounded sv
                 , workerThreads    = running
-                , workLoop         = workLoopFIFO runStreamFIFO
-                                        st{streamVar = Just sv} q
+                , workLoop         = workLoopFIFO q st{streamVar = Just sv} sv
                 , enqueue          = enqueueFIFO sv q
                 , isWorkDone       = nullQ q
                 , needDoorBell     = wfw
@@ -209,7 +279,7 @@ newAsyncVar :: MonadAsync m
     => State Stream m a -> Stream m a -> m (SVar Stream m a)
 newAsyncVar st m = do
     sv <- liftIO $ getLifoSVar st
-    sendWorker sv m
+    sendFirstWorker sv m
 
 -- XXX Get rid of this?
 -- | Make a stream asynchronous, triggers the computation and returns a stream
@@ -233,7 +303,7 @@ newWAsyncVar :: MonadAsync m
     => State Stream m a -> Stream m a -> m (SVar Stream m a)
 newWAsyncVar st m = do
     sv <- liftIO $ getFifoSVar st
-    sendWorker sv m
+    sendFirstWorker sv m
 
 ------------------------------------------------------------------------------
 -- Running streams concurrently

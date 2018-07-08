@@ -115,16 +115,18 @@ import Prelude hiding (map)
 -- Thererefore the queue never has more than on item in it.
 
 workLoopAhead :: MonadIO m
-    => State Stream m a
-    -> IORef ([Stream m a], Int)
+    => IORef ([Stream m a], Int)
     -> IORef (Heap (Entry Int (AheadHeapEntry Stream m a)) , Int)
+    -> State Stream m a
+    -> SVar Stream m a
+    -> WorkerInfo
     -> m ()
-workLoopAhead st q heap = runHeap
+workLoopAhead q heap st sv winfo = runHeap
 
     where
 
-    sv = fromJust $ streamVar st
-    maxBuf = bufferHigh st
+    -- sv = fromJust $ streamVar st
+    maxBuf = maxBufferLimit sv
     toHeap seqNo ent = do
         hp <- liftIO $ atomicModifyIORefCAS heap $ \(h, snum) ->
             ((H.insert (Entry seqNo ent) h, snum), h)
@@ -137,21 +139,21 @@ workLoopAhead st q heap = runHeap
                 return $ if r >= 0 then r else maxHeap
         if H.size hp <= limit
         then runHeap
-        else liftIO $ sendStop sv
+        else liftIO $ sendStop sv winfo
 
     singleToHeap seqNo a = toHeap seqNo (AheadEntryPure a)
     yieldToHeap seqNo a r = toHeap seqNo (AheadEntryStream (a `K.cons` r))
 
     singleOutput seqNo a = do
-        continue <- liftIO $ sendYield maxBuf sv (ChildYield a)
+        continue <- liftIO $ sendYield sv winfo (ChildYield a)
         if continue
         then runQueueToken seqNo
         else liftIO $ do
             atomicModifyIORefCAS_ heap $ \(h, _) -> (h, seqNo + 1)
-            sendStop sv
+            sendStop sv winfo
 
     yieldOutput seqNo a r = do
-        continue <- liftIO $ sendYield maxBuf sv (ChildYield a)
+        continue <- liftIO $ sendYield sv winfo (ChildYield a)
         if continue
         then unStream r st (runQueueToken seqNo)
                            (singleOutput seqNo)
@@ -159,7 +161,7 @@ workLoopAhead st q heap = runHeap
         else liftIO $ do
             atomicModifyIORefCAS_ heap $ \(h, _) ->
                 (H.insert (Entry seqNo (AheadEntryStream r)) h, seqNo)
-            sendStop sv
+            sendStop sv winfo
 
     {-# INLINE runQueueToken #-}
     runQueueToken prevSeqNo = do
@@ -209,7 +211,7 @@ workLoopAhead st q heap = runHeap
             Nothing -> do
                 done <- queueEmptyAhead q
                 if done
-                then liftIO $ sendStop sv
+                then liftIO $ sendStop sv winfo
                 else runQueueNoToken
             Just (Entry seqNo hent) -> do
                 case hent of

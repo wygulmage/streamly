@@ -28,10 +28,14 @@ module Streamly.Streams.SVar
     , maxThreads
     , maxBuffer
     , maxYields
+    , maxRate
     )
 where
 
 import Control.Monad.Catch (throwM)
+import Control.Monad.IO.Class (liftIO)
+import Data.IORef (readIORef, writeIORef)
+import Data.Maybe (fromJust)
 
 import Streamly.SVar
 import Streamly.Streams.StreamK
@@ -75,6 +79,10 @@ fromStreamVar sv = Stream $ \st stp sng yld -> do
         case ev of
             ChildYield a -> yld a rest
             ChildStop tid e -> do
+                liftIO $ putStrLn $ "childstop"
+                case expectedYieldLatency sv of
+                    Nothing -> return ()
+                    Just _ -> updateLatency sv
                 accountThread sv tid
                 case e of
                     Nothing -> unStream rest (rstState st) stp sng yld
@@ -96,8 +104,10 @@ toSVar sv m = toStreamVar sv (toStream m)
 -- XXX need to write these in direct style otherwise they will break fusion.
 --
 -- | Specify the maximum number of threads that can be spawned concurrently
--- when using concurrent streams. This is not the grand total number of threads
--- but the maximum number of threads at each point of concurrency.
+-- when using concurrent streams. This values denotes maximum in-flight
+-- requests or tasks in progress at any given point of time. Note that this is
+-- not the grand total number of threads but maximum threads at each point of
+-- concurrency.
 -- A value of 0 resets the thread limit to default, a negative value means
 -- there is no limit. The default value is 1500.
 --
@@ -128,6 +138,43 @@ maxBuffer n m = fromStream $ Stream $ \st stp sng yld -> do
 {-# RULES "maxBuffer serial" maxBuffer = maxBufferSerial #-}
 maxBufferSerial :: Int -> SerialT m a -> SerialT m a
 maxBufferSerial _ = id
+
+-- | Specify the maximum rate in number of yields per second at which the
+-- stream can be generated. A value of 0 resets the rate to default, a negative
+-- value means there is no limit. The default value is no limit.
+--
+-- @since 0.4.0
+{-# INLINE_NORMAL maxRate #-}
+maxRate :: IsStream t => Double -> t m a -> t m a
+maxRate n m = fromStream $ Stream $ \st stp sng yld -> do
+    let n' = if n == 0 then defaultMaxRate else n
+    unStream (toStream m) (st {maxStreamRate = n'}) stp sng yld
+
+{-# RULES "maxRate serial" maxRate = maxRateSerial #-}
+maxRateSerial :: Double -> SerialT m a -> SerialT m a
+maxRateSerial _ = id
+
+-- | Specify the average latency, in nanoseconds, of a single threaded action
+-- in a concurrent composition. Streamly can measure the latencies, but that is
+-- possible only after at least one task has completed. This combinator can be
+-- used to provide a latency hint so that rate control using 'maxRate' can take
+-- that into account right from the beginning. When not specified then a
+-- default behavior is chosen which could be too slow or too fast, and would be
+-- restricted by any other control parameters configured.
+-- A value of 0 indicates default behavior, a negative value means there is no
+-- limit i.e. zero latency.
+-- This would normally be useful only in high latency and high throughput
+-- cases.
+--
+{-# INLINE_NORMAL serialLatency #-}
+serialLatency :: IsStream t => Int -> t m a -> t m a
+serialLatency n m = fromStream $ Stream $ \st stp sng yld -> do
+    let n' = if n == 0 then defaultWorkerLatency else n
+    unStream (toStream m) (st {workerLatency = n'}) stp sng yld
+
+{-# RULES "serialLatency serial" serialLatency = serialLatencySerial #-}
+serialLatencySerial :: Int -> SerialT m a -> SerialT m a
+serialLatencySerial _ = id
 
 -- Stop concurrent dispatches after this limit. This is useful in API's like
 -- "take" where we want to dispatch only upto the number of elements "take"
