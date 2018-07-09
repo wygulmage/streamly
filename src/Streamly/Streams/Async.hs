@@ -144,16 +144,17 @@ getLifoSVar st = do
             Nothing -> return Nothing
             Just x -> Just <$> newIORef x
     let pacedMode = maxStreamRate st > 0
-    (eyl, cyl, lyl, paceInfo) <-
+    (latency, measured, wcur, wcol, wlong) <-
         if pacedMode
         then do
-            let eyl = round $ 1.0e9 / (maxStreamRate st)
-            cyl <- newIORef (0,0)
-            lyl <- newIORef 0
-            paceInfo <- newIORef $ FastWorker 0
-            return (Just eyl, Just cyl, Just lyl, Just paceInfo)
-        else return (Nothing, Nothing, Nothing, Nothing)
-    wlp <- newIORef $ if pacedMode then 10000 else 0
+            let latency = round $ 1.0e9 / (maxStreamRate st)
+            measured <- newIORef 0
+            wcur <- newIORef (0,0)
+            wcol <- newIORef (0,0)
+            wlong <- newIORef (0,0)
+            return (Just latency, Just measured, Just wcur, Just wcol, Just wlong)
+        else return (Nothing, Nothing, Nothing, Nothing, Nothing)
+    period <- newIORef $ if pacedMode then 1000 else 0
 
 #ifdef DIAGNOSTICS
     disp <- newIORef 0
@@ -167,12 +168,13 @@ getLifoSVar st = do
             SVar { outputQueue      = outQ
                  , maxYieldLimit    = yl
                  , maxBufferLimit   = bufferHigh st
-                 , expectedYieldLatency = eyl
+                 , expectedYieldLatency = latency
                  , workerBootstrapLatency = Just $ workerLatency st
-                 , workerLatencyPeriod = wlp
-                 , workerMeasuredLatency = lyl
-                 , workerCurrentLatency = cyl
-                 , workerPacingInfo = paceInfo
+                 , workerLatencyPeriod = period
+                 , workerMeasuredLatency = measured
+                 , workerCurrentLatency = wcur
+                 , workerCollectedLatency = wcol
+                 , workerLongTermLatency = wlong
                  , outputDoorBell   = outQMv
                  , readOutputQ      =
                         if pacedMode
@@ -217,16 +219,17 @@ getFifoSVar st = do
             Nothing -> return Nothing
             Just x -> Just <$> newIORef x
     let pacedMode = maxStreamRate st > 0
-    (eyl, cyl, lyl, paceInfo) <-
+    (latency, measured, wcur, wcol, wlong) <-
         if pacedMode
         then do
-            let eyl = round $ 1.0e9 / (maxStreamRate st)
-            cyl <- newIORef (0,0)
-            lyl <- newIORef 0
-            paceInfo <- newIORef $ FastWorker 0
-            return (Just eyl, Just cyl, Just lyl, Just paceInfo)
-        else return (Nothing, Nothing, Nothing, Nothing)
-    wlp <- newIORef $ if pacedMode then 1000 else 0
+            let latency = round $ 1.0e9 / (maxStreamRate st)
+            measured <- newIORef 0
+            wcur <- newIORef (0,0)
+            wcol <- newIORef (0,0)
+            wlong <- newIORef (0,0)
+            return (Just latency, Just measured, Just wcur, Just wcol, Just wlong)
+        else return (Nothing, Nothing, Nothing, Nothing, Nothing)
+    period <- newIORef $ if pacedMode then 1000 else 0
 
 #ifdef DIAGNOSTICS
     disp <- newIORef 0
@@ -239,12 +242,13 @@ getFifoSVar st = do
            SVar { outputQueue      = outQ
                 , maxYieldLimit    = yl
                 , maxBufferLimit   = bufferHigh st
-                , expectedYieldLatency = eyl
+                , expectedYieldLatency = latency
                 , workerBootstrapLatency = Just $ workerLatency st
-                , workerLatencyPeriod = wlp
-                , workerMeasuredLatency = lyl
-                , workerCurrentLatency = cyl
-                , workerPacingInfo = paceInfo
+                , workerLatencyPeriod = period
+                , workerMeasuredLatency = measured
+                , workerCurrentLatency = wcur
+                , workerCollectedLatency = wcol
+                , workerLongTermLatency = wlong
                 , outputDoorBell   = outQMv
                 , readOutputQ      =
                         if pacedMode

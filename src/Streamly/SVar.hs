@@ -38,7 +38,6 @@ module Streamly.SVar
 
     , atomicModifyIORefCAS
     , WorkerInfo (..)
-    , WorkerPacingInfo (..)
     , ChildEvent (..)
     , AheadHeapEntry (..)
     , sendYield
@@ -52,7 +51,7 @@ module Streamly.SVar
     , dequeueAhead
     , dequeueFromHeap
 
-    , updateLatency
+    , collectLatency
     , postProcessBounded
     , postProcessPaced
     , readOutputQBounded
@@ -175,10 +174,6 @@ data WorkerInfo = WorkerInfo
     , workerLatencyStart  :: IORef (Int, TimeSpec)
     }
 
-data WorkerPacingInfo =
-      FastWorker Int -- delay between dispatches
-    | SlowWorker (TimeSpec, Int) -- next schedule, delay between additional dispatches
-
 data SVar t m a = SVar
     {
     -- Read only state
@@ -206,10 +201,26 @@ data SVar t m a = SVar
     -- 0 means no latency computation
     , workerLatencyPeriod :: IORef Int
     , workerBootstrapLatency :: Maybe Int
+    -- measured latency over a long period of time used for making adjustments
+    -- so that we can keep this close to the expected latency. Note that the
+    -- consumer may be lazy or may take a lot of time in processing, we do not
+    -- account that, we only account for how many items we yielded in how much
+    -- time.
+    , workerLongTermLatency :: Maybe (IORef (Int, Int))
+    -- short term latency for short term estimates (nanoseconds)
     , workerMeasuredLatency :: Maybe (IORef Int)
-    -- latency computation (yieldCount, timeTaken)
-    , workerCurrentLatency :: Maybe (IORef (Int, Int))
-    , workerPacingInfo :: Maybe (IORef WorkerPacingInfo)
+    -- This is the second level stat which is an accmulation from
+    -- collectedLatency stats. We keep accumulating latencies in this bucket
+    -- until we have stats for a sufficient period and then we reset it and
+    -- move the average latency to workerMeasuredLatency. These are stats for a
+    -- relatively shorter window.
+    -- (yieldCount, timeTaken)
+    , workerCollectedLatency :: Maybe (IORef (Int, Int))
+    -- This is in progress latency stats maintained by the workers which we
+    -- empty into collectedLatency stats whenever we process the stream
+    -- elements yielded in this period.
+    -- (yieldCount, timeTaken)
+    , workerCurrentLatency   :: Maybe (IORef (Int, Int))
 
     -- Used only by bounded SVar types
     , enqueue        :: t m a -> IO ()
@@ -430,15 +441,16 @@ workerUpdateLatency sv winfo =
     case workerCurrentLatency sv of
         Nothing -> return ()
         Just ref -> do
-            (cnt0, t0) <- readIORef (workerLatencyStart winfo)
             cnt1 <- readIORef (workerYieldCount winfo)
-            t1 <- getTime Monotonic
+            -- The worker may return without yielding anything.
+            when (cnt1 /= 0) $ do
+                (cnt0, t0) <- readIORef (workerLatencyStart winfo)
+                t1 <- getTime Monotonic
+                writeIORef (workerLatencyStart winfo) (cnt1, t1)
 
-            writeIORef (workerLatencyStart winfo) (cnt1, t1)
-
-            let period = fromInteger $ toNanoSecs (t1 - t0)
-            atomicModifyIORefCAS ref $ \(ycnt, ytime) ->
-                ((ycnt + cnt1 - cnt0, ytime + period), ())
+                let period = fromInteger $ toNanoSecs (t1 - t0)
+                atomicModifyIORefCAS ref $ \(ycnt, ytime) ->
+                    ((ycnt + cnt1 - cnt0, ytime + period), ())
 
 {-# INLINE sendYield #-}
 sendYield :: SVar t m a -> WorkerInfo -> ChildEvent a -> IO Bool
@@ -716,7 +728,7 @@ recordMaxWorkers sv = liftIO $ do
 {-# NOINLINE pushWorker #-}
 pushWorker :: MonadAsync m => Int -> SVar t m a -> m ()
 pushWorker yieldCount sv = do
-    liftIO $ putStrLn $ "pushWorker"
+    -- liftIO $ putStrLn $ "pushWorker"
     liftIO $ atomicModifyIORefCAS_ (workerCount sv) $ \n -> n + 1
 #ifdef DIAGNOSTICS
     recordMaxWorkers sv
@@ -762,7 +774,7 @@ dispatchWorker sv maxWorkerLimit yieldCount = do
         -- processing in fromStreamVar and therefore it is safe to read and
         -- use it without a lock.
         cnt <- liftIO $ readIORef $ workerCount sv
-        liftIO $ putStrLn $ "workerCount " ++ show cnt
+        -- liftIO $ putStrLn $ "workerCount " ++ show cnt
         -- Note that we may deadlock if the previous workers (tasks in the
         -- stream) wait/depend on the future workers (tasks in the stream)
         -- executing. In that case we should either configure the maxWorker
@@ -778,177 +790,159 @@ dispatchWorker sv maxWorkerLimit yieldCount = do
                     else lim
         when (cnt < limit || limit < 0) $ pushWorker yieldCount sv
 
--- XXX divide by zero protection
-updateLatency :: MonadIO m => SVar t m a -> m ()
-updateLatency sv = do
-    let wml = fromJust $ workerMeasuredLatency sv
-    lat <- do
-        let wcl = fromJust $ workerCurrentLatency sv
-        val <- liftIO $ readIORef wcl
-        liftIO $ putStrLn $ "latencyInfo = " ++ show val
-        liftIO $ atomicModifyIORefCAS wcl $ \v@(cnt, t) ->
+-- In nanoseconds
+minThreadDelay :: Int
+minThreadDelay = 10^(6 :: Int)
+
+nanoToMicroSecs :: Int -> Int
+nanoToMicroSecs s = s `div` 1000
+
+threadDelayNanoSecs :: Int -> IO ()
+threadDelayNanoSecs = threadDelay . nanoToMicroSecs
+
+-- Returns a triple, (1) yield count since last collection, (2) collected
+-- latency i.e. how much time was taken by these yields, (3) average latency
+-- maintained over a longer period. The former two are used for accurate
+-- measurement of the going rate whereas the average is used for future
+-- estimates e.g. how many workers should be maintained to maintain the rate.
+collectLatency :: MonadIO m => SVar t m a -> m (Int, Int, Int)
+collectLatency sv = do
+    (count, time) <- do
+        let cur = fromJust $ workerCurrentLatency sv
+        liftIO $ atomicModifyIORefCAS cur $ \v -> ((0,0), v)
+
+    let col = fromJust $ workerCollectedLatency sv
+    (count1, time1) <- liftIO $ readIORef col
+    let count2 = count1 + count
+        time2 = time1 + time
+
+    let longTerm = fromJust $ workerLongTermLatency sv
+    (lcount, ltime) <- liftIO $ readIORef longTerm
+    let lcount' = lcount + count2
+        ltime'  = ltime + time2
+
+    let measured = fromJust $ workerMeasuredLatency sv
+    prev <- liftIO $ readIORef measured
+
+    -- XXX is minThreadDelay too long? Do we need wall clock time instead?
+    if (prev /= 0 && time2 > minThreadDelay) || (prev == 0 && count2 > 0)
+    then do
+        liftIO $ writeIORef col (0, 0)
+        -- XXX we need to reset this as well in a longish duration
+        liftIO $ writeIORef longTerm (lcount', ltime')
+        -- If time2 is nonzero, count2 must be nonzero too
+        if (count2 == 0)
+        then error $ "count1 = " ++ show count1 ++ "count = " ++ show count ++
+            "time = " ++ show time ++ "time1 = " ++ show time1
+        else return ()
+        let new = time2 `div` count2
+        liftIO $ writeIORef measured new
+        return (lcount', ltime', new)
+    else do
+        liftIO $ writeIORef col (count2, time2)
+        return (lcount', ltime', prev)
+
+{-
+-- Get the worker latency without collecting
+getWorkerLatency :: SVar t m a -> m (Maybe Int)
+getWorkerLatency sv = do
+    let measured = fromJust $ workerMeasuredLatency sv
+    t <- liftIO $ readIORef measured
+    if t /= 0
+    then return $ Just t
+    else do
+        let col = fromJust $ workerCollectedLatency sv
+        (cnt0, time0, _) <- liftIO $ readIORef col
+        if cnt0 > 0
+        then return $ Just (time0 `div` cnt0)
+        else
+            let cur = fromJust $ workerCurrentLatency sv
+            (cnt, time) <- liftIO $ readIORef cur
             if cnt > 0
-            then ((0,0), Just $ t `div` cnt)
-            else (v, Nothing)
-    case lat of
-        Nothing -> do
-            -- liftIO $ putStrLn $ "latency Nothing"
-            return ()
-        Just l -> do
-            liftIO $ putStrLn $ "latency = " ++ show l
-            liftIO $ writeIORef wml l
+            then return $ Just (time `div` cnt)
+            else return $ workerBootstrapLatency sv
 
--- Course correction - if there is a shortfall or gain in the last
--- period, we add that in the current period and determine the
--- expectedLatency according to that.
+data WorkerMode = FastMode | SlowMode
 
--- XXX need to use maxThreads limit
+slowWorkerContinue :: SVar t m a -> m Bool
+slowWorkerContinue sv = do
+    let expectedLat = fromJust $ expectedYieldLatency sv
+    r <- getWorkerLatency sv
+    case r of
+        Nothing -> return FastMode -- default
+        Just workerLat -> do
+            if expectedLat >= workerLat
+            then return FastMode
+            else return SlowMode
+                -}
+
+-- If increasing the number of workers accumulates more deficit then we are
+-- above the system capacity. And should not increase the number of workers
+-- further unless the deficit reduces.
+--
 -- {-# NOINLINE dispatchWorkerPaced #-}
 dispatchWorkerPaced :: MonadAsync m => SVar t m a -> m ()
 dispatchWorkerPaced sv = do
-{-
-    let ref = fromJust $ workerPacingInfo sv
-    pinfo <- liftIO $ readIORef ref
-    case pinfo of
-        FastWorker d -> do
-            -- liftIO $ putStrLn $ "FastWorker: " ++ show d
-            liftIO $ threadDelay (d `div` 1000)
-        SlowWorker _t -> do
-            -- liftIO $ putStrLn $ "SlowWorker: " ++ show _t
-            -- XXX need to dispatch a limited worker if it is
-            -- about time.
-            return ()
-            -}
+    tr@(count, time, wLatency) <- collectLatency sv
+    liftIO $ putStrLn $ "dispatchWorkerPaced: " ++ show tr
+    if wLatency == 0
+    then do
+        -- wait for the first worker to come back
+        -- XXX do we need a pushWorker here?
+        -- XXX assert that there are pending workers
+        liftIO $ putStrLn "not yet"
+        return ()
+    else do
+        let expectedLat = fromJust $ expectedYieldLatency sv
+            -- Calculate how many workers do we need to maintain the rate.
+            nWorkers = (fromIntegral wLatency) / (fromIntegral expectedLat)
+            -- XXX put a cap on extraworkers. Should not be more than nWorkers.
+            -- XXX this time should be serial time
+            extraWorkers = ((fromIntegral time) / (fromIntegral expectedLat)) - (fromIntegral count)
+            netWorkers = min (round $ nWorkers + extraWorkers) 1500
 
-    -- XXX we should not dispatch if the buffer is full
-    -- liftIO $ putStrLn $ "dispatchWorkerPaced: expectedLat = " ++ show
-    -- expectedLat
-    -- XXX for first time latency update add a sleep if required
-    updateLatency sv
-    r <- getWorkerLat
-    case r of
-        Nothing -> return ()
-        Just workerLat -> do
-            let ref = fromJust $ workerPacingInfo sv
-            pacingInfo <- liftIO $ readIORef ref
-            if workerLat <= expectedLat
-            then do
-                let deficit = case pacingInfo of
-                        FastWorker x -> x
-                        SlowWorker _ -> 0
-                idle <- dispatchFastWorker deficit expectedLat workerLat
-                -- set mode to Sleep idle and sleep after collecting the
-                -- result. XXX at collection we can measure the actual time
-                -- taken and adjust sleep time according to that.
-                liftIO $ writeIORef ref $ FastWorker idle
-                return ()
-            else do
-                let dispatchNow = do
-                        t <- dispatchSlowWorker workerLat
-                        -- t <- dispatchFastWorker expectedLat workerLat
-                        liftIO $ writeIORef ref $ SlowWorker t
+        liftIO $ putStrLn $ "nWorkers: " ++ show nWorkers
+        liftIO $ putStrLn $ "extraWorkers: " ++ show extraWorkers
+        liftIO $ putStrLn $ "netWorkers: " ++ show netWorkers
+        if netWorkers <= 0
+        then do
+            let sleepTime = (count * expectedLat) - time
+            liftIO $ putStrLn $ "sleepTime: " ++ show sleepTime
 
-                case pacingInfo of
-                    FastWorker _ -> dispatchNow
-                    SlowWorker (t, _) -> do
-                        tNow <- liftIO $ getTime Monotonic
-                        if (tNow >= t)
-                        then dispatchNow
-                        else do
-                            workersDone <- allThreadsDone sv
-                            if workersDone
-                            then do
-                                let delay = fromInteger $ toNanoSecs $ t - tNow
-                                -- XXX we can calculate it based on the current
-                                -- latency.
-                                if delay >= minThreadDelay
-                                then liftIO $ threadDelay (delay `div` 1000)
-                                else return ()
-                                dispatchNow
-                            -- XXX we are not guaranteed to be woken up in time
-                            -- we need a wakeup call
-                            else return ()
+            when (sleepTime >= minThreadDelay) $ do
+                liftIO $ threadDelay $ nanoToMicroSecs sleepTime
+                let longTerm = fromJust $ workerLongTermLatency sv
+                liftIO $ modifyIORef longTerm $ \(c, t) -> (c, t + sleepTime)
+
+            n <- countDispatchYields (expectedLat - wLatency)
+            cnt <- liftIO $ readIORef $ workerCount sv
+            when (cnt < 1) $ dispatchWorker sv 1500 (max n 1)
+        else do
+            -- XXX stagger the workers
+            cnt <- liftIO $ readIORef $ workerCount sv
+            when (cnt < netWorkers) $
+                void $ replicateM (netWorkers - cnt) $
+                    dispatchWorker sv 1500 1
+        {-
+            cnt <- liftIO $ readIORef $ workerCount sv
+            when (cnt < 1) $ dispatchWorker sv (-1) 0
+                    -}
+
     where
 
-    minThreadDelay = 10^(6::Int)
-    expectedLat = fromJust $ expectedYieldLatency sv
-    getWorkerLat =
-        case workerMeasuredLatency sv of
-            Nothing ->
-                case workerBootstrapLatency sv of
-                    Nothing -> do
-                        -- Just send a worker to yield a single item to measure
-                        -- the first latency, to test the waters.
-                        pushWorker 1 sv
-                        return Nothing
-                    Just t -> return $ Just t
-            Just ref -> do
-                t <- liftIO $ readIORef ref
-                return $ Just t
-
-    -- dispatch a worker and sleep for the idle time
-    dispatchFastWorker deficit effectiveLat workerLat = do
-        liftIO $ putStrLn $ "dispatchFastWorker: effectiveLat = " ++
-              show effectiveLat ++ " workerLat = " ++ show workerLat
+    countDispatchYields idleTime = do
+        -- XXX assert idleTime >= 0
         -- we do not want to sleep for less than 1 ms
-        let idleTime = let diff = effectiveLat - workerLat
-                        in if diff <= 0 then 0 else diff
-        -- XXX if there is already a worker we should not push another
-        -- e.g. when we switched from slow worker mode
-        -- When we are consuming from the buffer and the buffer is full, we
-        -- need to consume slowly. Or we should shorten the buffer so that we
-        -- can never produce too much too fast, the workers will come back as
-        -- soon as the buffer is full.
         let maxYieldsPerWorker = 1500
         if idleTime < minThreadDelay
         then do
-            if idleTime /= 0
-            then do
-                let n = (minThreadDelay + idleTime) `div` idleTime
-                liftIO $ putStrLn $ "sleep time: " ++ show (n * idleTime)
-                liftIO $ putStrLn $ "n = " ++ show n
-                let n' = min n maxYieldsPerWorker
-                -- if the sleep time is lower than 1ms then we carry
-                -- it forward to the next iteration and sleep when the
-                -- accumulated time is >= 1 ms.
-                let sleepTime = n' * idleTime + deficit
-                arrears <-
-                    if sleepTime >= minThreadDelay
-                    then do
-                        liftIO $ threadDelay (sleepTime `div` 1000)
-                        return 0
-                    else return sleepTime
-                dispatchWorker sv (-1) n'
-                return arrears
+            if idleTime == 0
+            then return maxYieldsPerWorker
             else do
-                liftIO $ putStrLn $ "sleep time: 0"
-                dispatchWorker sv (-1) maxYieldsPerWorker
-                return deficit
-        else do
-            liftIO $ putStrLn $ "sleep time: " ++ show (idleTime)
-            liftIO $ threadDelay ((idleTime + deficit) `div` 1000)
-            dispatchWorker sv (-1) 1
-            return 0
+                let n = (minThreadDelay + idleTime) `div` idleTime
+                return $ min n maxYieldsPerWorker
+        else return 1
 
-    -- no time to sleep, we need to dispatch many workers instead
-    -- XXX Once we hit the limit, latency may decrease by increasing the number
-    -- of threads. We need to adapt to such condition. We can keep latency
-    -- stats for each n, where n is the number of threads.
-    dispatchSlowWorker workerLat = do
-        let (n, extra) = workerLat `divMod` expectedLat
-            -- To account for the fractional part we need to send an extra
-            -- single yield worker once in a while. We need an extra yield
-            -- every t time period where t is given by:
-            -- XXX need to take care of the fraction here as well
-            -- XXX t can become very big, we need to limit it to some
-            -- reasonable value.
-            tExtra = if extra /= 0 then workerLat `div` extra else 0
-        liftIO $ putStrLn $ "dispatchSlowWorker: " ++
-              " workerLat = " ++ show workerLat ++ " n = " ++ show n
-        t0 <- liftIO $ getTime Monotonic
-        -- XXX pace the dispatch
-        void $ replicateM n $ dispatchWorker sv (-1) 1
-        return (t0 + fromNanoSecs (toInteger workerLat), tExtra)
 
 {-# NOINLINE sendWorkerWait #-}
 sendWorkerWait :: MonadAsync m => Int -> SVar t m a -> m ()
@@ -1106,11 +1100,7 @@ postProcessPaced sv = do
         when (not r) $ dispatchWorkerPaced sv
         return r
     else do
-        let ref = fromJust $ workerPacingInfo sv
-        pinfo <- liftIO $ readIORef ref
-        case pinfo of
-            FastWorker _ -> return ()
-            SlowWorker _ -> dispatchWorkerPaced sv
+        dispatchWorkerPaced sv
         return False
 
 getAheadSVar :: MonadAsync m
@@ -1134,16 +1124,17 @@ getAheadSVar st f = do
             Nothing -> return Nothing
             Just x -> Just <$> newIORef x
     let pacedMode = maxStreamRate st > 0
-    (eyl, cyl, lyl, paceInfo) <-
+    (latency, measured, wcur, wcol, wlong) <-
         if pacedMode
         then do
-            let eyl = round $ 1.0e9 / (maxStreamRate st)
-            cyl <- newIORef (0,0)
-            lyl <- newIORef 0
-            paceInfo <- newIORef $ FastWorker 0
-            return (Just eyl, Just cyl, Just lyl, Just paceInfo)
-        else return (Nothing, Nothing, Nothing, Nothing)
-    wlp <- newIORef $ if pacedMode then 1000 else 0
+            let latency = round $ 1.0e9 / (maxStreamRate st)
+            measured <- newIORef 0
+            wcur <- newIORef (0,0)
+            wcol <- newIORef (0,0)
+            wlong <- newIORef (0,0)
+            return (Just latency, Just measured, Just wcur, Just wcol, Just wlong)
+        else return (Nothing, Nothing, Nothing, Nothing, Nothing)
+    period <- newIORef $ if pacedMode then 1000 else 0
 
 #ifdef DIAGNOSTICS
     disp <- newIORef 0
@@ -1156,14 +1147,15 @@ getAheadSVar st f = do
             SVar { outputQueue      = outQ
                  , maxYieldLimit    = yl
                  , maxBufferLimit   = bufferHigh st
-                 , expectedYieldLatency = eyl
+                 , expectedYieldLatency = latency
                  , workerBootstrapLatency = Just $ workerLatency st
                  -- XXX should depend on workerBootstrapLatency
                  -- and later updated whenever workerMeasuredLatency changes
-                 , workerLatencyPeriod = wlp
-                 , workerMeasuredLatency = lyl
-                 , workerCurrentLatency = cyl
-                 , workerPacingInfo = paceInfo
+                 , workerLatencyPeriod = period
+                 , workerMeasuredLatency = measured
+                 , workerCurrentLatency = wcur
+                 , workerCollectedLatency = wcol
+                 , workerLongTermLatency = wlong
                  , outputDoorBell   = outQMv
                  , readOutputQ      =
                         if pacedMode
@@ -1231,7 +1223,8 @@ getParallelSVar = do
                  , workerBootstrapLatency = undefined
                  , workerMeasuredLatency = undefined
                  , workerCurrentLatency = undefined
-                 , workerPacingInfo = undefined
+                 , workerCollectedLatency = undefined
+                 , workerLongTermLatency = undefined
                  , outputDoorBell   = outQMv
                  , readOutputQ      = readOutputQPar sv
                  , postProcess      = allThreadsDone sv
