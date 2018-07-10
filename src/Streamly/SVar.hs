@@ -877,9 +877,9 @@ slowWorkerContinue sv = do
             else return SlowMode
                 -}
 
--- If increasing the number of workers accumulates more deficit then we are
--- above the system capacity. And should not increase the number of workers
--- further unless the deficit reduces.
+-- XXX we can have a maxEfficiency combinator as well which runs the producer
+-- at the maximal efficiency i.e. the number of workers are chosen such that
+-- the latency is minimum or within a range. Or we can call it maxLatency.
 --
 -- {-# NOINLINE dispatchWorkerPaced #-}
 dispatchWorkerPaced :: MonadAsync m => SVar t m a -> m ()
@@ -899,32 +899,27 @@ dispatchWorkerPaced sv = do
             expectedLat = fromJust $ expectedYieldLatency sv
             -- Calculate how many workers do we need to maintain the rate.
             nWorkers = (fromIntegral wLatency) / (fromIntegral expectedLat)
-            -- XXX put a cap on extraworkers. Should not be more than nWorkers.
-            -- Bridge the gap slowly rather than in a burst in one go. That
-            -- also gives us time to observe if increasing the workers is
-            -- actually helping, if it is not helping we should reduce the
-            -- workers instead. If increasing the workers reduces the overall
-            -- latency per yield of the workers then we should not increase
-            -- them. XXX for this we need to have the worker latencies as well
-            -- in the longterm latency. And we need to keep the last figure to
-            -- compare i.e. before we increased the workers.
+
+            -- Increasing the workers may reduce the overall latency per yield
+            -- of the workers, sometimes quite a bit. We need to keep a latency
+            -- histogram for 1,2,4..2^20 workers so that we can decide which
+            -- bucket is optimal and decide the number of workers based on
+            -- that.
             --
-            -- We should account for the buffer-full time in this? Yes. We
-            -- should not send extra workers just because the consumer was
-            -- slow.
+            -- XXX We should account for the buffer-full time in this. We
+            -- should never send extra workers just because the consumer was
+            -- slow but always send if the producer was slow.
+            --
+            -- XXX put a cap on extraworkers. Should not be more than nWorkers.
+            -- Bridge the gap slowly rather than in a burst in one go.
             extraWorkers = ((fromIntegral time) / (fromIntegral expectedLat)) - (fromIntegral count)
-            netWorkers = min (round $ nWorkers + extraWorkers) 1500
+            netWorkers = min (round $ nWorkers + 0) 1500
 
         liftIO $ putStrLn $ "nWorkers: " ++ show nWorkers
         liftIO $ putStrLn $ "extraWorkers: " ++ show extraWorkers
         liftIO $ putStrLn $ "netWorkers: " ++ show netWorkers
         if netWorkers <= 0
         then do
-            -- We should sleep only if even after accounting the consumption
-            -- time we still have time. If during consumption we figure out we
-            -- are getitng delayed then we should trigger dispatch there as well.
-            --
-            -- We should account for the buffer-full time in this? No.
             let sleepTime = (count * expectedLat) - time
             liftIO $ putStrLn $ "sleepTime: " ++ show sleepTime
 
@@ -1069,30 +1064,24 @@ readOutputQBounded n sv = do
 
 readOutputQPaced :: MonadAsync m => Int -> SVar t m a -> m [ChildEvent a]
 readOutputQPaced maxWorkerLimit sv = do
-    -- XXX now that we have got the latency we should disptach the
-    -- right amount of workers even before we process the output so
-    -- that we do not add further delay. We need to know the latency
-    -- even before processing the outputQueue.
     -- XXX we should first try to read without the MVar and then block only if
     -- needed.
     liftIO $ withDBGMVar sv "paceModeBlockingRead"
                      $ takeMVar (outputDoorBell sv)
+    -- XXX should we try to dispatch workers here as well?
     -- XXX assert that the outputQueue will have non-zero length here
     -- liftIO $ (readOutputQRaw sv >>= return . fst)
     (list, len) <- liftIO $ readOutputQRaw sv
     liftIO $ putStrLn $ "len = " ++ show len
     return list
-    -- XXX we should try to check on the workers after consuming every n item
-    -- from the buffer?
 
 -- XXX need to pass the maxWorkerLimit here as well or set it in the sv
 postProcessBounded :: MonadAsync m => SVar t m a -> m Bool
 postProcessBounded sv = do
     workersDone <- allThreadsDone sv
-    -- There may still be work pending even if there are no workers
-    -- pending because all the workers may return if the
-    -- outputQueue becomes full. In that case send off a worker to
-    -- kickstart the work again.
+    -- There may still be work pending even if there are no workers pending
+    -- because all the workers may return if the outputQueue becomes full. In
+    -- that case send off a worker to kickstart the work again.
     if workersDone
     then do
         r <- liftIO $ isWorkDone sv
@@ -1103,10 +1092,14 @@ postProcessBounded sv = do
 postProcessPaced :: MonadAsync m => SVar t m a -> m Bool
 postProcessPaced sv = do
     workersDone <- allThreadsDone sv
-    -- There may still be work pending even if there are no workers
-    -- pending because all the workers may return if the
-    -- outputQueue becomes full. In that case send off a worker to
-    -- kickstart the work again.
+    -- There may still be work pending even if there are no workers pending
+    -- because all the workers may return if the outputQueue becomes full. In
+    -- that case send off a worker to kickstart the work again.
+    --
+    -- XXX If during consumption we figure out we are getting delayed then we
+    -- should trigger dispatch there as well.  We should try to check on the
+    -- workers after consuming every n item from the buffer?
+    --
     if workersDone
     then do
         r <- liftIO $ isWorkDone sv
