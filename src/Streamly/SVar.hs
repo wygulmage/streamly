@@ -206,7 +206,7 @@ data SVar t m a = SVar
     -- consumer may be lazy or may take a lot of time in processing, we do not
     -- account that, we only account for how many items we yielded in how much
     -- time.
-    , workerLongTermLatency :: Maybe (IORef (Int, Int))
+    , workerLongTermLatency :: Maybe (IORef (Int, TimeSpec))
     -- short term latency for short term estimates (nanoseconds)
     , workerMeasuredLatency :: Maybe (IORef Int)
     -- This is the second level stat which is an accmulation from
@@ -805,7 +805,7 @@ threadDelayNanoSecs = threadDelay . nanoToMicroSecs
 -- maintained over a longer period. The former two are used for accurate
 -- measurement of the going rate whereas the average is used for future
 -- estimates e.g. how many workers should be maintained to maintain the rate.
-collectLatency :: MonadIO m => SVar t m a -> m (Int, Int, Int)
+collectLatency :: MonadIO m => SVar t m a -> m (Int, TimeSpec, Int)
 collectLatency sv = do
     (count, time) <- do
         let cur = fromJust $ workerCurrentLatency sv
@@ -819,7 +819,6 @@ collectLatency sv = do
     let longTerm = fromJust $ workerLongTermLatency sv
     (lcount, ltime) <- liftIO $ readIORef longTerm
     let lcount' = lcount + count2
-        ltime'  = ltime + time2
 
     let measured = fromJust $ workerMeasuredLatency sv
     prev <- liftIO $ readIORef measured
@@ -829,7 +828,9 @@ collectLatency sv = do
     then do
         liftIO $ writeIORef col (0, 0)
         -- XXX we need to reset this as well in a longish duration
-        liftIO $ writeIORef longTerm (lcount', ltime')
+        -- XXX we should remove the consumer idle time from this.
+        -- or the toal latency should be the worker latency + consumer latency
+        liftIO $ modifyIORef longTerm $ \(_, t) -> (lcount', t)
         -- If time2 is nonzero, count2 must be nonzero too
         if (count2 == 0)
         then error $ "count1 = " ++ show count1 ++ "count = " ++ show count ++
@@ -837,10 +838,10 @@ collectLatency sv = do
         else return ()
         let new = time2 `div` count2
         liftIO $ writeIORef measured new
-        return (lcount', ltime', new)
+        return (lcount', ltime, new)
     else do
         liftIO $ writeIORef col (count2, time2)
-        return (lcount', ltime', prev)
+        return (lcount', ltime, prev)
 
 {-
 -- Get the worker latency without collecting
@@ -883,7 +884,7 @@ slowWorkerContinue sv = do
 -- {-# NOINLINE dispatchWorkerPaced #-}
 dispatchWorkerPaced :: MonadAsync m => SVar t m a -> m ()
 dispatchWorkerPaced sv = do
-    tr@(count, time, wLatency) <- collectLatency sv
+    tr@(count, tstamp, wLatency) <- collectLatency sv
     liftIO $ putStrLn $ "dispatchWorkerPaced: " ++ show tr
     if wLatency == 0
     then do
@@ -893,11 +894,24 @@ dispatchWorkerPaced sv = do
         liftIO $ putStrLn "not yet"
         return ()
     else do
-        let expectedLat = fromJust $ expectedYieldLatency sv
+        now <- liftIO $ getTime Monotonic
+        let time = fromInteger $ toNanoSecs $ now - tstamp
+            expectedLat = fromJust $ expectedYieldLatency sv
             -- Calculate how many workers do we need to maintain the rate.
             nWorkers = (fromIntegral wLatency) / (fromIntegral expectedLat)
             -- XXX put a cap on extraworkers. Should not be more than nWorkers.
-            -- XXX this time should be serial time
+            -- Bridge the gap slowly rather than in a burst in one go. That
+            -- also gives us time to observe if increasing the workers is
+            -- actually helping, if it is not helping we should reduce the
+            -- workers instead. If increasing the workers reduces the overall
+            -- latency per yield of the workers then we should not increase
+            -- them. XXX for this we need to have the worker latencies as well
+            -- in the longterm latency. And we need to keep the last figure to
+            -- compare i.e. before we increased the workers.
+            --
+            -- We should account for the buffer-full time in this? Yes. We
+            -- should not send extra workers just because the consumer was
+            -- slow.
             extraWorkers = ((fromIntegral time) / (fromIntegral expectedLat)) - (fromIntegral count)
             netWorkers = min (round $ nWorkers + extraWorkers) 1500
 
@@ -906,13 +920,16 @@ dispatchWorkerPaced sv = do
         liftIO $ putStrLn $ "netWorkers: " ++ show netWorkers
         if netWorkers <= 0
         then do
+            -- We should sleep only if even after accounting the consumption
+            -- time we still have time. If during consumption we figure out we
+            -- are getitng delayed then we should trigger dispatch there as well.
+            --
+            -- We should account for the buffer-full time in this? No.
             let sleepTime = (count * expectedLat) - time
             liftIO $ putStrLn $ "sleepTime: " ++ show sleepTime
 
             when (sleepTime >= minThreadDelay) $ do
                 liftIO $ threadDelay $ nanoToMicroSecs sleepTime
-                let longTerm = fromJust $ workerLongTermLatency sv
-                liftIO $ modifyIORef longTerm $ \(c, t) -> (c, t + sleepTime)
 
             n <- countDispatchYields (expectedLat - wLatency)
             cnt <- liftIO $ readIORef $ workerCount sv
@@ -922,11 +939,7 @@ dispatchWorkerPaced sv = do
             cnt <- liftIO $ readIORef $ workerCount sv
             when (cnt < netWorkers) $
                 void $ replicateM (netWorkers - cnt) $
-                    dispatchWorker sv 1500 1
-        {-
-            cnt <- liftIO $ readIORef $ workerCount sv
-            when (cnt < 1) $ dispatchWorker sv (-1) 0
-                    -}
+                    dispatchWorker sv 1500 0
 
     where
 
@@ -1131,7 +1144,8 @@ getAheadSVar st f = do
             measured <- newIORef 0
             wcur <- newIORef (0,0)
             wcol <- newIORef (0,0)
-            wlong <- newIORef (0,0)
+            now <- getTime Monotonic
+            wlong <- newIORef (0,now)
             return (Just latency, Just measured, Just wcur, Just wcol, Just wlong)
         else return (Nothing, Nothing, Nothing, Nothing, Nothing)
     period <- newIORef $ if pacedMode then 1000 else 0

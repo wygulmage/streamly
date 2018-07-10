@@ -49,6 +49,7 @@ import Data.Concurrent.Queue.MichaelScott (LinkedQueue, newQ, nullQ, tryPopR)
 import Data.IORef (IORef, newIORef, readIORef)
 import Data.Maybe (fromJust)
 import Data.Semigroup (Semigroup(..))
+import System.Clock
 
 import Prelude hiding (map)
 import qualified Data.Set as S
@@ -151,7 +152,8 @@ getLifoSVar st = do
             measured <- newIORef 0
             wcur <- newIORef (0,0)
             wcol <- newIORef (0,0)
-            wlong <- newIORef (0,0)
+            now <- getTime Monotonic
+            wlong <- newIORef (0,now)
             return (Just latency, Just measured, Just wcur, Just wcol, Just wlong)
         else return (Nothing, Nothing, Nothing, Nothing, Nothing)
     period <- newIORef $ if pacedMode then 1000 else 0
@@ -226,7 +228,8 @@ getFifoSVar st = do
             measured <- newIORef 0
             wcur <- newIORef (0,0)
             wcol <- newIORef (0,0)
-            wlong <- newIORef (0,0)
+            now <- getTime Monotonic
+            wlong <- newIORef (0,now)
             return (Just latency, Just measured, Just wcur, Just wcol, Just wlong)
         else return (Nothing, Nothing, Nothing, Nothing, Nothing)
     period <- newIORef $ if pacedMode then 1000 else 0
