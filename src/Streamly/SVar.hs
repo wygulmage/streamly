@@ -766,10 +766,14 @@ pushWorkerPar sv wloop = do
 #endif
     doFork wloop (handleChildException sv) >>= modifyThread sv
 
-dispatchWorker :: MonadAsync m => SVar t m a -> Int -> Int -> m ()
+-- Returns:
+-- True: can dispatch more
+-- False: cannot dispatch any more
+dispatchWorker :: MonadAsync m => SVar t m a -> Int -> Int -> m Bool
 dispatchWorker sv maxWorkerLimit yieldCount = do
     done <- liftIO $ isWorkDone sv
-    when (not done) $ do
+    if (not done)
+    then do
         -- Note that the worker count is only decremented during event
         -- processing in fromStreamVar and therefore it is safe to read and
         -- use it without a lock.
@@ -788,7 +792,12 @@ dispatchWorker sv maxWorkerLimit yieldCount = do
                     if maxWorkerLimit > 0
                     then min maxWorkerLimit lim
                     else lim
-        when (cnt < limit || limit < 0) $ pushWorker yieldCount sv
+        if (cnt < limit || limit < 0)
+        then do
+            pushWorker yieldCount sv
+            return True
+        else return False
+    else return False
 
 -- In nanoseconds
 minThreadDelay :: Int
@@ -881,9 +890,12 @@ slowWorkerContinue sv = do
 -- at the maximal efficiency i.e. the number of workers are chosen such that
 -- the latency is minimum or within a range. Or we can call it maxLatency.
 --
+-- Returns:
+-- True: can dispatch more
+-- False: full, no more dispatches
 -- {-# NOINLINE dispatchWorkerPaced #-}
-dispatchWorkerPaced :: MonadAsync m => SVar t m a -> m ()
-dispatchWorkerPaced sv = do
+dispatchWorkerPaced :: MonadAsync m => Int -> SVar t m a -> m Bool
+dispatchWorkerPaced maxWorkerLimit sv = do
     tr@(count, tstamp, wLatency) <- collectLatency sv
     liftIO $ putStrLn $ "dispatchWorkerPaced: " ++ show tr
     if wLatency == 0
@@ -892,7 +904,7 @@ dispatchWorkerPaced sv = do
         -- XXX do we need a pushWorker here?
         -- XXX assert that there are pending workers
         liftIO $ putStrLn "not yet"
-        return ()
+        return False
     else do
         now <- liftIO $ getTime Monotonic
         let time = fromInteger $ toNanoSecs $ now - tstamp
@@ -900,26 +912,28 @@ dispatchWorkerPaced sv = do
             -- Calculate how many workers do we need to maintain the rate.
             nWorkers = (fromIntegral wLatency) / (fromIntegral expectedLat)
 
-            -- Increasing the workers may reduce the overall latency per yield
-            -- of the workers, sometimes quite a bit. We need to keep a latency
-            -- histogram for 1,2,4..2^20 workers so that we can decide which
-            -- bucket is optimal and decide the number of workers based on
-            -- that.
+            -- XXX Increasing the workers may reduce the overall latency per
+            -- yield of the workers, sometimes quite a bit. We need to keep a
+            -- latency histogram for 1,2,4..2^20 workers so that we can decide
+            -- which bucket is optimal and decide the number of workers based
+            -- on that.
             --
             -- XXX We should account for the buffer-full time in this. We
             -- should never send extra workers just because the consumer was
-            -- slow but always send if the producer was slow.
+            -- slow but always send if the producer was slower than expected.
             --
             -- XXX put a cap on extraworkers. Should not be more than nWorkers.
             -- Bridge the gap slowly rather than in a burst in one go.
             extraWorkers = ((fromIntegral time) / (fromIntegral expectedLat)) - (fromIntegral count)
-            netWorkers = min (round $ nWorkers + 0) 1500
+            netWorkers = min (round $ nWorkers + extraWorkers) maxWorkerLimit
 
         liftIO $ putStrLn $ "nWorkers: " ++ show nWorkers
         liftIO $ putStrLn $ "extraWorkers: " ++ show extraWorkers
         liftIO $ putStrLn $ "netWorkers: " ++ show netWorkers
         if netWorkers <= 0
         then do
+            -- we should sleep only when the consumer is idle i.e. done
+            -- consuming all the produced items.
             let sleepTime = (count * expectedLat) - time
             liftIO $ putStrLn $ "sleepTime: " ++ show sleepTime
 
@@ -928,20 +942,21 @@ dispatchWorkerPaced sv = do
 
             n <- countDispatchYields (expectedLat - wLatency)
             cnt <- liftIO $ readIORef $ workerCount sv
-            when (cnt < 1) $ dispatchWorker sv 1500 (max n 1)
+            when (cnt < 1) $ void $ dispatchWorker sv maxWorkerLimit (max n 1)
+            return False
         else do
             -- XXX stagger the workers
             cnt <- liftIO $ readIORef $ workerCount sv
-            when (cnt < netWorkers) $
-                void $ replicateM (netWorkers - cnt) $
-                    dispatchWorker sv 1500 0
+            if (cnt < netWorkers)
+            then dispatchWorker sv maxWorkerLimit 1
+            else return False
 
     where
 
     countDispatchYields idleTime = do
         -- XXX assert idleTime >= 0
         -- we do not want to sleep for less than 1 ms
-        let maxYieldsPerWorker = 1500
+        let maxYieldsPerWorker = maxBufferLimit sv
         if idleTime < minThreadDelay
         then do
             if idleTime == 0
@@ -951,6 +966,34 @@ dispatchWorkerPaced sv = do
                 return $ min n maxYieldsPerWorker
         else return 1
 
+{-# NOINLINE sendWorkerWaitPaced #-}
+sendWorkerWaitPaced :: MonadAsync m => Int -> SVar t m a -> m ()
+sendWorkerWaitPaced maxWorkerLimit sv = do
+    (_, n) <- liftIO $ readIORef (outputQueue sv)
+    when (n <= 0) $ do
+        liftIO $ atomicModifyIORefCAS_ (needDoorBell sv) $ const True
+        liftIO $ storeLoadBarrier
+        dispatched <- dispatchWorkerPaced maxWorkerLimit sv
+        if dispatched
+        then do
+            -- liftIO $ putStrLn $ "sendWorkerWaitPaced: dispatched"
+            done <- liftIO $ isWorkDone sv
+            if done
+            then do
+                liftIO $ withDBGMVar sv "sendWorkerWaitPaced: nothing to do"
+                                 $ takeMVar (outputDoorBell sv)
+                (_, len) <- liftIO $ readIORef (outputQueue sv)
+                when (len <= 0) $ sendWorkerWaitPaced maxWorkerLimit sv
+            else sendWorkerWaitPaced maxWorkerLimit sv
+        else liftIO $ do
+            -- putStrLn $ "sendWorkerWaitPaced: waiting"
+            atomicModifyIORefCAS_ (needDoorBell sv) $ const False
+            withDBGMVar sv "sendWorkerWaitPaced: worker limit reached"
+                             $ takeMVar (outputDoorBell sv)
+            -- Consume any unwanted doorbell
+            (_, len) <- readIORef (outputQueue sv)
+            when (len <= 0) $ takeMVar (outputDoorBell sv)
+            -- putStrLn $ "sendWorkerWaitPaced: got data"
 
 {-# NOINLINE sendWorkerWait #-}
 sendWorkerWait :: MonadAsync m => Int -> SVar t m a -> m ()
@@ -1006,7 +1049,7 @@ sendWorkerWait maxWorkerLimit sv = do
 
         liftIO $ atomicModifyIORefCAS_ (needDoorBell sv) $ const True
         liftIO $ storeLoadBarrier
-        dispatchWorker sv maxWorkerLimit 0
+        dispatched <- dispatchWorker sv maxWorkerLimit 0
 
         -- XXX test for the case when we miss sending a worker when the worker
         -- count is more than 1500.
@@ -1015,14 +1058,23 @@ sendWorkerWait maxWorkerLimit sv = do
         -- least one outstanding worker. Otherwise we could be sleeping
         -- forever.
 
-        done <- liftIO $ isWorkDone sv
-        if done
+        if dispatched
         then do
-            liftIO $ withDBGMVar sv "sendWorkerWait: nothing to do"
+            done <- liftIO $ isWorkDone sv
+            if done
+            then do
+                liftIO $ withDBGMVar sv "sendWorkerWait: nothing to do"
+                                 $ takeMVar (outputDoorBell sv)
+                (_, len) <- liftIO $ readIORef (outputQueue sv)
+                when (len <= 0) $ sendWorkerWait maxWorkerLimit sv
+            else sendWorkerWait maxWorkerLimit sv
+        else liftIO $ do
+            atomicModifyIORefCAS_ (needDoorBell sv) $ const False
+            withDBGMVar sv "sendWorkerWait: no more dispatches"
                              $ takeMVar (outputDoorBell sv)
-            (_, len) <- liftIO $ readIORef (outputQueue sv)
-            when (len <= 0) $ sendWorkerWait maxWorkerLimit sv
-        else sendWorkerWait maxWorkerLimit sv
+            -- Consume any unwanted doorbell
+            (_, len) <- readIORef (outputQueue sv)
+            when (len <= 0) $ takeMVar (outputDoorBell sv)
 
 {-# INLINE readOutputQRaw #-}
 readOutputQRaw :: SVar t m a -> IO ([ChildEvent a], Int)
@@ -1035,7 +1087,7 @@ readOutputQRaw sv = do
     return (list, len)
 
 readOutputQBounded :: MonadAsync m => Int -> SVar t m a -> m [ChildEvent a]
-readOutputQBounded n sv = do
+readOutputQBounded maxWorkerLimit sv = do
     (list, len) <- liftIO $ readOutputQRaw sv
     -- When there is no output seen we dispatch more workers to help
     -- out if there is work pending in the work queue.
@@ -1059,21 +1111,34 @@ readOutputQBounded n sv = do
 
     {-# INLINE blockingRead #-}
     blockingRead = do
-        sendWorkerWait n sv
+        sendWorkerWait maxWorkerLimit sv
         liftIO $ (readOutputQRaw sv >>= return . fst)
 
 readOutputQPaced :: MonadAsync m => Int -> SVar t m a -> m [ChildEvent a]
 readOutputQPaced maxWorkerLimit sv = do
-    -- XXX we should first try to read without the MVar and then block only if
-    -- needed.
-    liftIO $ withDBGMVar sv "paceModeBlockingRead"
-                     $ takeMVar (outputDoorBell sv)
-    -- XXX should we try to dispatch workers here as well?
-    -- XXX assert that the outputQueue will have non-zero length here
-    -- liftIO $ (readOutputQRaw sv >>= return . fst)
     (list, len) <- liftIO $ readOutputQRaw sv
-    liftIO $ putStrLn $ "len = " ++ show len
-    return list
+    -- When there is no output seen we dispatch more workers to help
+    -- out if there is work pending in the work queue.
+    if len <= 0
+    then blockingRead
+    else do
+        -- liftIO $ putStrLn $ "readOutputQPaced: no blocking, data ready"
+        -- send a worker proactively, if needed, even before we start
+        -- processing the output.  This may degrade single processor
+        -- perf but improves multi-processor, because of more
+        -- parallelism
+        -- liftIO $ putStrLn $ "readOutputQPaced: proactive dispatch"
+        -- void $ dispatchWorkerPaced maxWorkerLimit sv
+        return list
+
+    where
+
+    {-# INLINE blockingRead #-}
+    blockingRead = do
+        -- liftIO $ putStrLn $ "readOutputQPaced: dispatch loop"
+        sendWorkerWaitPaced maxWorkerLimit sv
+        -- liftIO $ putStrLn $ "readOutputQPaced: got data"
+        liftIO $ (readOutputQRaw sv >>= return . fst)
 
 -- XXX need to pass the maxWorkerLimit here as well or set it in the sv
 postProcessBounded :: MonadAsync m => SVar t m a -> m Bool
@@ -1103,11 +1168,11 @@ postProcessPaced sv = do
     if workersDone
     then do
         r <- liftIO $ isWorkDone sv
-        when (not r) $ dispatchWorkerPaced sv
+        when (not r) $ do
+            liftIO $ putStrLn $ "postProcessPaced: post dispatch"
+            void $ dispatchWorkerPaced 1 sv
         return r
-    else do
-        dispatchWorkerPaced sv
-        return False
+    else return False
 
 getAheadSVar :: MonadAsync m
     => State t m a
