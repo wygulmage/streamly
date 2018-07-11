@@ -199,6 +199,8 @@ data SVar t m a = SVar
     -- latency suddenly becomes too high this count may remain too high for
     -- long time, in such cases the consumer can change it.
     -- 0 means no latency computation
+    -- XXX this is derivable from workerMeasuredLatency
+    -- can be removed.
     , workerLatencyPeriod :: IORef Int
     , workerBootstrapLatency :: Maybe Int
     -- measured latency over a long period of time used for making adjustments
@@ -832,25 +834,32 @@ collectLatency sv = do
     let measured = fromJust $ workerMeasuredLatency sv
     prev <- liftIO $ readIORef measured
 
-    -- XXX is minThreadDelay too long? Do we need wall clock time instead?
-    if (prev /= 0 && time2 > minThreadDelay) || (prev == 0 && count2 > 0)
+    if (count > 0)
     then do
-        liftIO $ writeIORef col (0, 0)
-        -- XXX we need to reset this as well in a longish duration
-        -- XXX we should remove the consumer idle time from this.
-        -- or the toal latency should be the worker latency + consumer latency
-        liftIO $ modifyIORef longTerm $ \(_, t) -> (lcount', t)
-        -- If time2 is nonzero, count2 must be nonzero too
-        if (count2 == 0)
-        then error $ "count1 = " ++ show count1 ++ "count = " ++ show count ++
-            "time = " ++ show time ++ "time1 = " ++ show time1
-        else return ()
         let new = time2 `div` count2
-        liftIO $ writeIORef measured new
-        return (lcount', ltime, new)
-    else do
-        liftIO $ writeIORef col (count2, time2)
-        return (lcount', ltime, prev)
+        -- To avoid minor fluctuations update in batches
+        if     (count2 > defaultMaxBuffer)
+            || (time2 > minThreadDelay)
+            || (let r = (fromIntegral new) / (fromIntegral prev)
+                 in prev > 0 && (r > 2 || r < 0.5))
+            || (prev == 0 && count2 > 0)
+        then do
+            let periodRef = workerLatencyPeriod sv
+                period = max 1 (min (minThreadDelay `div` new) defaultMaxBuffer)
+            liftIO $ putStrLn $ "period = " ++ show period
+            liftIO $ writeIORef periodRef period
+            -- liftIO $ writeIORef periodRef 1
+            liftIO $ writeIORef col (0, 0)
+            -- XXX we need to reset this as well in a longish duration
+            -- XXX we should remove the consumer idle time from this.
+            -- or the toal latency should be the worker latency + consumer latency
+            liftIO $ modifyIORef longTerm $ \(_, t) -> (lcount', t)
+            liftIO $ writeIORef measured new
+            return (lcount', ltime, new)
+        else do
+            liftIO $ writeIORef col (count2, time2)
+            return (lcount', ltime, prev)
+    else return (lcount', ltime, prev)
 
 {-
 -- Get the worker latency without collecting
@@ -886,6 +895,33 @@ slowWorkerContinue sv = do
             else return SlowMode
                 -}
 
+countDispatchWorkers :: MonadIO m => Int -> Int -> Int -> Int -> Int -> m Int
+countDispatchWorkers maxWorkerLimit count duration wLatency expectedLat = do
+    -- Calculate how many workers do we need to maintain the rate.
+
+    -- XXX Increasing the workers may reduce the overall latency per
+    -- yield of the workers, sometimes quite a bit. We need to keep a
+    -- latency histogram for 1,2,4..2^20 workers so that we can decide
+    -- which bucket is optimal and decide the number of workers based
+    -- on that.
+    --
+    -- XXX We should account for the buffer-full time in this. We
+    -- should never send extra workers just because the consumer was
+    -- slow but always send if the producer was slower than expected.
+    --
+    -- XXX put a cap on extraworkers. Should not be more than nWorkers.
+    -- Bridge the gap slowly rather than in a burst in one go.
+    --
+    -- XXX when the consumer is slow we need extraWorkers = 0
+    --
+    let nWorkers = (fromIntegral wLatency) / (fromIntegral expectedLat)
+        extraWorkers = ((fromIntegral duration) / (fromIntegral expectedLat)) - (fromIntegral count)
+        netWorkers = min (round $ nWorkers + extraWorkers) maxWorkerLimit
+    liftIO $ putStrLn $ "nWorkers: " ++ show nWorkers
+    liftIO $ putStrLn $ "extraWorkers: " ++ show extraWorkers
+    liftIO $ putStrLn $ "netWorkers: " ++ show netWorkers
+    return netWorkers
+
 -- XXX we can have a maxEfficiency combinator as well which runs the producer
 -- at the maximal efficiency i.e. the number of workers are chosen such that
 -- the latency is minimum or within a range. Or we can call it maxLatency.
@@ -898,43 +934,21 @@ dispatchWorkerPaced :: MonadAsync m => Int -> SVar t m a -> m Bool
 dispatchWorkerPaced maxWorkerLimit sv = do
     tr@(count, tstamp, wLatency) <- collectLatency sv
     liftIO $ putStrLn $ "dispatchWorkerPaced: " ++ show tr
+
     if wLatency == 0
-    then do
-        -- wait for the first worker to come back
-        -- XXX do we need a pushWorker here?
-        -- XXX assert that there are pending workers
-        liftIO $ putStrLn "not yet"
-        return False
+    -- Need to measure the latency with a single worker before we can perform
+    -- any computation.
+    then return False
     else do
         now <- liftIO $ getTime Monotonic
-        let time = fromInteger $ toNanoSecs $ now - tstamp
-            expectedLat = fromJust $ expectedYieldLatency sv
-            -- Calculate how many workers do we need to maintain the rate.
-            nWorkers = (fromIntegral wLatency) / (fromIntegral expectedLat)
+        let duration = fromInteger $ toNanoSecs $ now - tstamp
+        let expectedLat = fromJust $ expectedYieldLatency sv
+        netWorkers <- countDispatchWorkers maxWorkerLimit count duration wLatency
+                                           expectedLat
 
-            -- XXX Increasing the workers may reduce the overall latency per
-            -- yield of the workers, sometimes quite a bit. We need to keep a
-            -- latency histogram for 1,2,4..2^20 workers so that we can decide
-            -- which bucket is optimal and decide the number of workers based
-            -- on that.
-            --
-            -- XXX We should account for the buffer-full time in this. We
-            -- should never send extra workers just because the consumer was
-            -- slow but always send if the producer was slower than expected.
-            --
-            -- XXX put a cap on extraworkers. Should not be more than nWorkers.
-            -- Bridge the gap slowly rather than in a burst in one go.
-            extraWorkers = ((fromIntegral time) / (fromIntegral expectedLat)) - (fromIntegral count)
-            netWorkers = min (round $ nWorkers + extraWorkers) maxWorkerLimit
-
-        liftIO $ putStrLn $ "nWorkers: " ++ show nWorkers
-        liftIO $ putStrLn $ "extraWorkers: " ++ show extraWorkers
-        liftIO $ putStrLn $ "netWorkers: " ++ show netWorkers
         if netWorkers <= 0
         then do
-            -- we should sleep only when the consumer is idle i.e. done
-            -- consuming all the produced items.
-            let sleepTime = (count * expectedLat) - time
+            let sleepTime = (count * expectedLat) - duration
             liftIO $ putStrLn $ "sleepTime: " ++ show sleepTime
 
             when (sleepTime >= minThreadDelay) $ do
@@ -956,7 +970,7 @@ dispatchWorkerPaced maxWorkerLimit sv = do
     countDispatchYields idleTime = do
         -- XXX assert idleTime >= 0
         -- we do not want to sleep for less than 1 ms
-        let maxYieldsPerWorker = maxBufferLimit sv
+        let maxYieldsPerWorker = defaultMaxBuffer
         if idleTime < minThreadDelay
         then do
             if idleTime == 0
@@ -1206,7 +1220,7 @@ getAheadSVar st f = do
             wlong <- newIORef (0,now)
             return (Just latency, Just measured, Just wcur, Just wcol, Just wlong)
         else return (Nothing, Nothing, Nothing, Nothing, Nothing)
-    period <- newIORef $ if pacedMode then 1000 else 0
+    period <- newIORef 1
 
 #ifdef DIAGNOSTICS
     disp <- newIORef 0
@@ -1221,8 +1235,6 @@ getAheadSVar st f = do
                  , maxBufferLimit   = bufferHigh st
                  , expectedYieldLatency = latency
                  , workerBootstrapLatency = Just $ workerLatency st
-                 -- XXX should depend on workerBootstrapLatency
-                 -- and later updated whenever workerMeasuredLatency changes
                  , workerLatencyPeriod = period
                  , workerMeasuredLatency = measured
                  , workerCurrentLatency = wcur

@@ -156,7 +156,7 @@ getLifoSVar st = do
             wlong <- newIORef (0,now)
             return (Just latency, Just measured, Just wcur, Just wcol, Just wlong)
         else return (Nothing, Nothing, Nothing, Nothing, Nothing)
-    period <- newIORef $ if pacedMode then 1000 else 0
+    period <- newIORef 1
 
 #ifdef DIAGNOSTICS
     disp <- newIORef 0
@@ -232,7 +232,7 @@ getFifoSVar st = do
             wlong <- newIORef (0,now)
             return (Just latency, Just measured, Just wcur, Just wcol, Just wlong)
         else return (Nothing, Nothing, Nothing, Nothing, Nothing)
-    period <- newIORef $ if pacedMode then 1000 else 0
+    period <- newIORef 1
 
 #ifdef DIAGNOSTICS
     disp <- newIORef 0
