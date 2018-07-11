@@ -223,6 +223,7 @@ data SVar t m a = SVar
     -- elements yielded in this period.
     -- (yieldCount, timeTaken)
     , workerCurrentLatency   :: Maybe (IORef (Int, Int))
+    , workerStopTimeStamp    :: IORef TimeSpec
 
     -- Used only by bounded SVar types
     , enqueue        :: t m a -> IO ()
@@ -492,7 +493,10 @@ sendStop :: SVar t m a -> WorkerInfo -> IO ()
 sendStop sv winfo = do
     t <- readIORef (workerLatencyPeriod sv)
     when (t /= 0) $ workerUpdateLatency sv winfo
-    liftIO $ atomicModifyIORefCAS_ (workerCount sv) $ \n -> n - 1
+    n <- liftIO $ atomicModifyIORefCAS (workerCount sv) $ \n -> (n - 1, n)
+    when (n == 1) $ do
+        t <- getTime Monotonic
+        writeIORef (workerStopTimeStamp sv) t
     myThreadId >>= \tid -> void $ send (-1) sv (ChildStop tid Nothing)
 
 -------------------------------------------------------------------------------
@@ -829,11 +833,25 @@ countDispatchWorkers maxWorkerLimit count duration wLatency expectedLat = do
     -- Bridge the gap slowly rather than in a burst in one go.
     --
     let nWorkers = (fromIntegral wLatency) / (fromIntegral expectedLat)
-        extraWorkers = ((fromIntegral duration) / (fromIntegral expectedLat)) - (fromIntegral count)
-        netWorkers = min (round $ nWorkers + extraWorkers) maxWorkerLimit
-    liftIO $ putStrLn $ "nWorkers: " ++ show nWorkers
-    liftIO $ putStrLn $ "extraWorkers: " ++ show extraWorkers
-    liftIO $ putStrLn $ "netWorkers: " ++ show netWorkers
+        d = fromIntegral duration
+        e = fromIntegral expectedLat
+        -- Give at least minThreadDelay to cover up the deficit or lose the
+        -- gain
+        n = max 1 (fromIntegral 1000 / fromIntegral wLatency)
+        -- extraWorkers = ((d / e) - (fromIntegral count)) / n
+        extraWorkers = (d / e) - (fromIntegral count)
+        extraWorkers' =
+            extraWorkers / n
+        {-
+            if extraWorkers < 0
+            then extraWorkers
+            else extraWorkers / n
+                -}
+        netWorkers = min (round $ nWorkers + extraWorkers') maxWorkerLimit
+    -- liftIO $ putStrLn $ "n: " ++ show n
+    -- liftIO $ putStrLn $ "nWorkers: " ++ show nWorkers
+    -- liftIO $ putStrLn $ "extraWorkers: " ++ show extraWorkers
+    -- liftIO $ putStrLn $ "netWorkers: " ++ show netWorkers
     return netWorkers
 
 -- Get the worker latency without resetting workerCurrentLatency
@@ -851,10 +869,14 @@ getWorkerLatency sv = do
     prev                <- readIORef measured
 
     let pendingCount = colCount + count
-        -- pendingTime  = colTime + time
-        -- XXX should we use the new latency?
+        pendingTime  = colTime + time
+        -- Take the average of previous and the latest
+        new =
+            if pendingCount > 0
+            then ((pendingTime `div` pendingCount) + prev) `div` 2
+            else prev
         lcount' = lcount + pendingCount
-    return (lcount', ltime, prev)
+    return (lcount', ltime, new)
 
 workerShouldStop :: MonadIO m => SVar t m a -> IO Bool
 workerShouldStop sv = do
@@ -862,6 +884,7 @@ workerShouldStop sv = do
     now <- getTime Monotonic
     let duration = fromInteger $ toNanoSecs $ now - tstamp
     let expectedLat = fromJust $ expectedYieldLatency sv
+    -- XXX need to get this from sv
     let maxWorkerLimit = 1500
     netWorkers <- countDispatchWorkers maxWorkerLimit count duration wLatency
                                        expectedLat
@@ -945,6 +968,17 @@ resetLatencies sv = do
     t <- getTime Monotonic
     writeIORef longTerm (0, t)
 
+adjustLatencies :: MonadIO m => SVar t m a -> IO ()
+adjustLatencies sv = do
+    let longTerm = fromJust $ workerLongTermLatency sv
+
+    t0 <- readIORef (workerStopTimeStamp sv)
+    t1 <- getTime Monotonic
+    -- when (t1 - t0 < 0) $ error $ "negative time: " ++ show (t1 - t0)
+    -- putStrLn $ "adjustLatencies: " ++ show (t1 - t0)
+    modifyIORef longTerm $ \(c, t) -> (c, t + t1 - t0)
+    return ()
+
 -- XXX we can have a maxEfficiency combinator as well which runs the producer
 -- at the maximal efficiency i.e. the number of workers are chosen such that
 -- the latency is minimum or within a range. Or we can call it maxLatency.
@@ -956,7 +990,7 @@ resetLatencies sv = do
 dispatchWorkerPaced :: MonadAsync m => Int -> SVar t m a -> m Bool
 dispatchWorkerPaced maxWorkerLimit sv = do
     tr@(count, tstamp, wLatency) <- liftIO $ collectLatency sv
-    liftIO $ putStrLn $ "dispatchWorkerPaced: " ++ show tr
+    -- liftIO $ putStrLn $ "dispatchWorkerPaced: " ++ show tr
 
     if wLatency == 0
     -- Need to measure the latency with a single worker before we can perform
@@ -972,7 +1006,7 @@ dispatchWorkerPaced maxWorkerLimit sv = do
         if netWorkers <= 0
         then do
             let sleepTime = (count * expectedLat) - duration
-            liftIO $ putStrLn $ "sleepTime: " ++ show sleepTime
+      --      liftIO $ putStrLn $ "sleepTime: " ++ show sleepTime
 
             when (sleepTime >= minThreadDelay) $ do
                 liftIO $ threadDelay $ nanoToMicroSecs sleepTime
@@ -1206,8 +1240,9 @@ postProcessPaced sv = do
     then do
         r <- liftIO $ isWorkDone sv
         when (not r) $ do
-            liftIO $ putStrLn $ "postProcessPaced: post dispatch"
-            liftIO $ resetLatencies sv
+--            liftIO $ putStrLn $ "postProcessPaced: post dispatch"
+            -- liftIO $ resetLatencies sv
+            liftIO $ adjustLatencies sv
             void $ dispatchWorkerPaced 1 sv
         return r
     else return False
@@ -1245,6 +1280,7 @@ getAheadSVar st f = do
             return (Just latency, Just measured, Just wcur, Just wcol, Just wlong)
         else return (Nothing, Nothing, Nothing, Nothing, Nothing)
     period <- newIORef 1
+    stopTime <- newIORef $ fromNanoSecs 0
 
 #ifdef DIAGNOSTICS
     disp <- newIORef 0
@@ -1262,6 +1298,7 @@ getAheadSVar st f = do
                  , workerLatencyPeriod = period
                  , workerMeasuredLatency = measured
                  , workerCurrentLatency = wcur
+                 , workerStopTimeStamp = stopTime
                  , workerCollectedLatency = wcol
                  , workerLongTermLatency = wlong
                  , outputDoorBell   = outQMv
@@ -1331,6 +1368,7 @@ getParallelSVar = do
                  , workerBootstrapLatency = undefined
                  , workerMeasuredLatency = undefined
                  , workerCurrentLatency = undefined
+                 , workerStopTimeStamp = undefined
                  , workerCollectedLatency = undefined
                  , workerLongTermLatency = undefined
                  , outputDoorBell   = outQMv

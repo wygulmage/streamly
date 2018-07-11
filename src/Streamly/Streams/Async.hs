@@ -157,6 +157,7 @@ getLifoSVar st = do
             return (Just latency, Just measured, Just wcur, Just wcol, Just wlong)
         else return (Nothing, Nothing, Nothing, Nothing, Nothing)
     period <- newIORef 1
+    stopTime <- newIORef $ fromNanoSecs 0
 
 #ifdef DIAGNOSTICS
     disp <- newIORef 0
@@ -175,6 +176,7 @@ getLifoSVar st = do
                  , workerLatencyPeriod = period
                  , workerMeasuredLatency = measured
                  , workerCurrentLatency = wcur
+                 , workerStopTimeStamp = stopTime
                  , workerCollectedLatency = wcol
                  , workerLongTermLatency = wlong
                  , outputDoorBell   = outQMv
@@ -233,6 +235,7 @@ getFifoSVar st = do
             return (Just latency, Just measured, Just wcur, Just wcol, Just wlong)
         else return (Nothing, Nothing, Nothing, Nothing, Nothing)
     period <- newIORef 1
+    stopTime <- newIORef $ fromNanoSecs 0
 
 #ifdef DIAGNOSTICS
     disp <- newIORef 0
@@ -250,6 +253,7 @@ getFifoSVar st = do
                 , workerLatencyPeriod = period
                 , workerMeasuredLatency = measured
                 , workerCurrentLatency = wcur
+                , workerStopTimeStamp = stopTime
                 , workerCollectedLatency = wcol
                 , workerLongTermLatency = wlong
                 , outputDoorBell   = outQMv
