@@ -455,7 +455,7 @@ workerUpdateLatency sv winfo =
                     ((ycnt + cnt1 - cnt0, ytime + period), ())
 
 {-# INLINE sendYield #-}
-sendYield :: SVar t m a -> WorkerInfo -> ChildEvent a -> IO Bool
+sendYield :: MonadIO m => SVar t m a -> WorkerInfo -> ChildEvent a -> IO Bool
 sendYield sv winfo msg = do
     let maxOutputQLen = maxBufferLimit sv
     ylimit <- case maxYieldLimit sv of
@@ -472,12 +472,16 @@ sendYield sv winfo msg = do
             let cnt1 = cnt + 1
             writeIORef (workerYieldCount winfo) cnt1
 
-            when (t /= 0 && (cnt1 `mod` t) == 0) $
-                workerUpdateLatency sv winfo
+            shouldStop <-
+                if (t /= 0 && (cnt1 `mod` t) == 0)
+                then do
+                    workerUpdateLatency sv winfo
+                    workerShouldStop sv
+                else return False
 
             if ymax == 0
-            then return True
-            else return $ cnt1 < ymax
+            then return $ not shouldStop
+            else return $ cnt1 < ymax && not shouldStop
         else return True
 
     r <- send maxOutputQLen sv msg
@@ -823,26 +827,26 @@ collectLatency sv = do
         liftIO $ atomicModifyIORefCAS cur $ \v -> ((0,0), v)
 
     let col = fromJust $ workerCollectedLatency sv
-    (count1, time1) <- liftIO $ readIORef col
-    let count2 = count1 + count
-        time2 = time1 + time
+    (colCount, colTime) <- liftIO $ readIORef col
 
     let longTerm = fromJust $ workerLongTermLatency sv
     (lcount, ltime) <- liftIO $ readIORef longTerm
-    let lcount' = lcount + count2
 
     let measured = fromJust $ workerMeasuredLatency sv
     prev <- liftIO $ readIORef measured
 
-    if (count > 0)
+    let pendingCount = colCount + count
+        pendingTime  = colTime + time
+        lcount' = lcount + pendingCount
+    if (pendingCount > 0)
     then do
-        let new = time2 `div` count2
+        let new = pendingTime `div` pendingCount
         -- To avoid minor fluctuations update in batches
-        if     (count2 > defaultMaxBuffer)
-            || (time2 > minThreadDelay)
+        if     (pendingCount > defaultMaxBuffer)
+            || (pendingTime > minThreadDelay)
             || (let r = (fromIntegral new) / (fromIntegral prev)
                  in prev > 0 && (r > 2 || r < 0.5))
-            || (prev == 0 && count2 > 0)
+            || (prev == 0 && pendingCount > 0)
         then do
             let periodRef = workerLatencyPeriod sv
                 period = max 1 (min (minThreadDelay `div` new) defaultMaxBuffer)
@@ -857,43 +861,9 @@ collectLatency sv = do
             liftIO $ writeIORef measured new
             return (lcount', ltime, new)
         else do
-            liftIO $ writeIORef col (count2, time2)
+            liftIO $ writeIORef col (pendingCount, pendingTime)
             return (lcount', ltime, prev)
     else return (lcount', ltime, prev)
-
-{-
--- Get the worker latency without collecting
-getWorkerLatency :: SVar t m a -> m (Maybe Int)
-getWorkerLatency sv = do
-    let measured = fromJust $ workerMeasuredLatency sv
-    t <- liftIO $ readIORef measured
-    if t /= 0
-    then return $ Just t
-    else do
-        let col = fromJust $ workerCollectedLatency sv
-        (cnt0, time0, _) <- liftIO $ readIORef col
-        if cnt0 > 0
-        then return $ Just (time0 `div` cnt0)
-        else
-            let cur = fromJust $ workerCurrentLatency sv
-            (cnt, time) <- liftIO $ readIORef cur
-            if cnt > 0
-            then return $ Just (time `div` cnt)
-            else return $ workerBootstrapLatency sv
-
-data WorkerMode = FastMode | SlowMode
-
-slowWorkerContinue :: SVar t m a -> m Bool
-slowWorkerContinue sv = do
-    let expectedLat = fromJust $ expectedYieldLatency sv
-    r <- getWorkerLatency sv
-    case r of
-        Nothing -> return FastMode -- default
-        Just workerLat -> do
-            if expectedLat >= workerLat
-            then return FastMode
-            else return SlowMode
-                -}
 
 countDispatchWorkers :: MonadIO m => Int -> Int -> Int -> Int -> Int -> m Int
 countDispatchWorkers maxWorkerLimit count duration wLatency expectedLat = do
@@ -921,6 +891,47 @@ countDispatchWorkers maxWorkerLimit count duration wLatency expectedLat = do
     liftIO $ putStrLn $ "extraWorkers: " ++ show extraWorkers
     liftIO $ putStrLn $ "netWorkers: " ++ show netWorkers
     return netWorkers
+
+-- Get the worker latency without updating
+getWorkerLatency :: MonadIO m => SVar t m a -> IO (Int, TimeSpec, Int)
+getWorkerLatency sv = do
+    let cur = fromJust $ workerCurrentLatency sv
+    (count, time) <- readIORef cur
+
+    let col = fromJust $ workerCollectedLatency sv
+    (colCount, colTime) <- readIORef col
+
+    let longTerm = fromJust $ workerLongTermLatency sv
+    (lcount, ltime) <- readIORef longTerm
+
+    let measured = fromJust $ workerMeasuredLatency sv
+    prev <- readIORef measured
+
+    let pendingCount = colCount + count
+        -- pendingTime  = colTime + time
+        -- XXX should we use the new latency?
+        lcount' = lcount + pendingCount
+    return (lcount', ltime, prev)
+
+workerShouldStop :: MonadIO m => SVar t m a -> IO Bool
+workerShouldStop sv = do
+    (count, tstamp, wLatency) <- getWorkerLatency sv
+    now <- getTime Monotonic
+    let duration = fromInteger $ toNanoSecs $ now - tstamp
+    let expectedLat = fromJust $ expectedYieldLatency sv
+    let maxWorkerLimit = 1500
+    netWorkers <- countDispatchWorkers maxWorkerLimit count duration wLatency
+                                       expectedLat
+    cnt <- readIORef $ workerCount sv
+    if netWorkers <= 0
+    then do
+        let sleepTime = (count * expectedLat) - duration
+        if sleepTime >= minThreadDelay
+        then return True
+        else return False
+    else if cnt > netWorkers
+         then return True
+         else return False
 
 -- XXX we can have a maxEfficiency combinator as well which runs the producer
 -- at the maximal efficiency i.e. the number of workers are chosen such that
@@ -962,7 +973,7 @@ dispatchWorkerPaced maxWorkerLimit sv = do
             -- XXX stagger the workers
             cnt <- liftIO $ readIORef $ workerCount sv
             if (cnt < netWorkers)
-            then dispatchWorker sv maxWorkerLimit 1
+            then dispatchWorker sv maxWorkerLimit 0
             else return False
 
     where
