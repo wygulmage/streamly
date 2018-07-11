@@ -82,7 +82,7 @@ fromStreamVar sv = Stream $ \st stp sng yld -> do
                 -- liftIO $ putStrLn $ "childstop"
                 case expectedYieldLatency sv of
                     Nothing -> return ()
-                    Just _ -> collectLatency sv >> return ()
+                    Just _ -> liftIO (collectLatency sv) >> return ()
                 accountThread sv tid
                 case e of
                     Nothing -> unStream rest (rstState st) stp sng yld

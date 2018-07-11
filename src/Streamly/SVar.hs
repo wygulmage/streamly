@@ -815,56 +815,6 @@ nanoToMicroSecs s = s `div` 1000
 threadDelayNanoSecs :: Int -> IO ()
 threadDelayNanoSecs = threadDelay . nanoToMicroSecs
 
--- Returns a triple, (1) yield count since last collection, (2) collected
--- latency i.e. how much time was taken by these yields, (3) average latency
--- maintained over a longer period. The former two are used for accurate
--- measurement of the going rate whereas the average is used for future
--- estimates e.g. how many workers should be maintained to maintain the rate.
-collectLatency :: MonadIO m => SVar t m a -> m (Int, TimeSpec, Int)
-collectLatency sv = do
-    (count, time) <- do
-        let cur = fromJust $ workerCurrentLatency sv
-        liftIO $ atomicModifyIORefCAS cur $ \v -> ((0,0), v)
-
-    let col = fromJust $ workerCollectedLatency sv
-    (colCount, colTime) <- liftIO $ readIORef col
-
-    let longTerm = fromJust $ workerLongTermLatency sv
-    (lcount, ltime) <- liftIO $ readIORef longTerm
-
-    let measured = fromJust $ workerMeasuredLatency sv
-    prev <- liftIO $ readIORef measured
-
-    let pendingCount = colCount + count
-        pendingTime  = colTime + time
-        lcount' = lcount + pendingCount
-    if (pendingCount > 0)
-    then do
-        let new = pendingTime `div` pendingCount
-        -- To avoid minor fluctuations update in batches
-        if     (pendingCount > defaultMaxBuffer)
-            || (pendingTime > minThreadDelay)
-            || (let r = (fromIntegral new) / (fromIntegral prev)
-                 in prev > 0 && (r > 2 || r < 0.5))
-            || (prev == 0 && pendingCount > 0)
-        then do
-            let periodRef = workerLatencyPeriod sv
-                period = max 1 (min (minThreadDelay `div` new) defaultMaxBuffer)
-            liftIO $ putStrLn $ "period = " ++ show period
-            liftIO $ writeIORef periodRef period
-            -- liftIO $ writeIORef periodRef 1
-            liftIO $ writeIORef col (0, 0)
-            -- XXX we need to reset this as well in a longish duration
-            -- XXX we should remove the consumer idle time from this.
-            -- or the toal latency should be the worker latency + consumer latency
-            liftIO $ modifyIORef longTerm $ \(_, t) -> (lcount', t)
-            liftIO $ writeIORef measured new
-            return (lcount', ltime, new)
-        else do
-            liftIO $ writeIORef col (pendingCount, pendingTime)
-            return (lcount', ltime, prev)
-    else return (lcount', ltime, prev)
-
 countDispatchWorkers :: MonadIO m => Int -> Int -> Int -> Int -> Int -> m Int
 countDispatchWorkers maxWorkerLimit count duration wLatency expectedLat = do
     -- Calculate how many workers do we need to maintain the rate.
@@ -875,14 +825,8 @@ countDispatchWorkers maxWorkerLimit count duration wLatency expectedLat = do
     -- which bucket is optimal and decide the number of workers based
     -- on that.
     --
-    -- XXX We should account for the buffer-full time in this. We
-    -- should never send extra workers just because the consumer was
-    -- slow but always send if the producer was slower than expected.
-    --
     -- XXX put a cap on extraworkers. Should not be more than nWorkers.
     -- Bridge the gap slowly rather than in a burst in one go.
-    --
-    -- XXX when the consumer is slow we need extraWorkers = 0
     --
     let nWorkers = (fromIntegral wLatency) / (fromIntegral expectedLat)
         extraWorkers = ((fromIntegral duration) / (fromIntegral expectedLat)) - (fromIntegral count)
@@ -892,20 +836,19 @@ countDispatchWorkers maxWorkerLimit count duration wLatency expectedLat = do
     liftIO $ putStrLn $ "netWorkers: " ++ show netWorkers
     return netWorkers
 
--- Get the worker latency without updating
+-- Get the worker latency without resetting workerCurrentLatency
+-- Returns (total yield count, base time, measured latency)
 getWorkerLatency :: MonadIO m => SVar t m a -> IO (Int, TimeSpec, Int)
 getWorkerLatency sv = do
-    let cur = fromJust $ workerCurrentLatency sv
-    (count, time) <- readIORef cur
+    let cur      = fromJust $ workerCurrentLatency sv
+        col      = fromJust $ workerCollectedLatency sv
+        longTerm = fromJust $ workerLongTermLatency sv
+        measured = fromJust $ workerMeasuredLatency sv
 
-    let col = fromJust $ workerCollectedLatency sv
+    (count, time)       <- readIORef cur
     (colCount, colTime) <- readIORef col
-
-    let longTerm = fromJust $ workerLongTermLatency sv
-    (lcount, ltime) <- readIORef longTerm
-
-    let measured = fromJust $ workerMeasuredLatency sv
-    prev <- readIORef measured
+    (lcount, ltime)     <- readIORef longTerm
+    prev                <- readIORef measured
 
     let pendingCount = colCount + count
         -- pendingTime  = colTime + time
@@ -933,6 +876,75 @@ workerShouldStop sv = do
          then return True
          else return False
 
+useCollectedBatch sv latency colRef measRef = do
+    let periodRef = workerLatencyPeriod sv
+        period    = max 1 (min (minThreadDelay `div` latency) defaultMaxBuffer)
+
+    writeIORef periodRef period
+    writeIORef colRef (0, 0)
+    writeIORef measRef latency
+
+-- Returns a triple, (1) yield count since last collection, (2) collected
+-- latency i.e. how much time was taken by these yields, (3) average latency
+-- maintained over a longer period. The former two are used for accurate
+-- measurement of the going rate whereas the average is used for future
+-- estimates e.g. how many workers should be maintained to maintain the rate.
+collectLatency :: MonadIO m => SVar t m a -> IO (Int, TimeSpec, Int)
+collectLatency sv = do
+    let cur      = fromJust $ workerCurrentLatency sv
+        col      = fromJust $ workerCollectedLatency sv
+        longTerm = fromJust $ workerLongTermLatency sv
+        measured = fromJust $ workerMeasuredLatency sv
+
+    (count, time)       <- atomicModifyIORefCAS cur $ \v -> ((0,0), v)
+    (colCount, colTime) <- readIORef col
+    (lcount, ltime)     <- readIORef longTerm
+    prev                <- readIORef measured
+
+    let pendingCount = colCount + count
+        pendingTime  = colTime + time
+
+        lcount' = lcount + pendingCount
+        notUpdated = (lcount', ltime, prev)
+
+    if (pendingCount > 0)
+    then do
+        let new = pendingTime `div` pendingCount
+        -- To avoid minor fluctuations update in batches
+        if     (pendingCount > defaultMaxBuffer)
+            || (pendingTime > minThreadDelay)
+            || (let r = (fromIntegral new) / (fromIntegral prev)
+                 in prev > 0 && (r > 2 || r < 0.5))
+            || (prev == 0)
+        then do
+            useCollectedBatch sv new col measured
+            modifyIORef longTerm $ \(_, t) -> (lcount', t)
+            return (lcount', ltime, new)
+        else do
+            writeIORef col (pendingCount, pendingTime)
+            return notUpdated
+    else return notUpdated
+
+resetLatencies :: MonadIO m => SVar t m a -> IO ()
+resetLatencies sv = do
+    let cur      = fromJust $ workerCurrentLatency sv
+        col      = fromJust $ workerCollectedLatency sv
+        longTerm = fromJust $ workerLongTermLatency sv
+        measured = fromJust $ workerMeasuredLatency sv
+
+    (count, time)       <- atomicModifyIORefCAS cur $ \v -> ((0,0), v)
+    (colCount, colTime) <- readIORef col
+
+    let pendingCount = colCount + count
+        pendingTime  = colTime + time
+
+    when (pendingCount > 0) $ do
+        let new = pendingTime `div` pendingCount
+        useCollectedBatch sv new col measured
+
+    t <- getTime Monotonic
+    writeIORef longTerm (0, t)
+
 -- XXX we can have a maxEfficiency combinator as well which runs the producer
 -- at the maximal efficiency i.e. the number of workers are chosen such that
 -- the latency is minimum or within a range. Or we can call it maxLatency.
@@ -943,7 +955,7 @@ workerShouldStop sv = do
 -- {-# NOINLINE dispatchWorkerPaced #-}
 dispatchWorkerPaced :: MonadAsync m => Int -> SVar t m a -> m Bool
 dispatchWorkerPaced maxWorkerLimit sv = do
-    tr@(count, tstamp, wLatency) <- collectLatency sv
+    tr@(count, tstamp, wLatency) <- liftIO $ collectLatency sv
     liftIO $ putStrLn $ "dispatchWorkerPaced: " ++ show tr
 
     if wLatency == 0
@@ -1195,6 +1207,7 @@ postProcessPaced sv = do
         r <- liftIO $ isWorkDone sv
         when (not r) $ do
             liftIO $ putStrLn $ "postProcessPaced: post dispatch"
+            liftIO $ resetLatencies sv
             void $ dispatchWorkerPaced 1 sv
         return r
     else return False
