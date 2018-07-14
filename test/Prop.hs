@@ -52,12 +52,13 @@ constructWithReplicateM
     => (t IO Int -> SerialT IO Int)
     -> Int
     -> Int
+    -> Double
     -> Word8
     -> Property
-constructWithReplicateM op thr buf len = withMaxSuccess maxTestCount $
+constructWithReplicateM op thr buf rate len = withMaxSuccess maxTestCount $
     monadicIO $ do
         let x = return (1 :: Int)
-        stream <- run $ (S.toList . op) (maxThreads thr $ maxBuffer buf $
+        stream <- run $ (S.toList . op) (maxRate rate $ maxThreads thr $ maxBuffer buf $
             S.replicateM (fromIntegral len) x)
         list <- run $ replicateM (fromIntegral len) x
         equals (==) stream list
@@ -601,22 +602,30 @@ monadBind constr t eq (a, b) = withMaxSuccess maxTestCount $
         let list = a >>= \x -> b >>= return . (+ x)
         equals eq stream list
 
-constructionConcurrent :: Int -> Int -> Spec
-constructionConcurrent thr buf = do
-    describe (" threads = " ++ show thr ++ "buffer = " ++ show buf) $ do
-        prop "asyncly replicateM" $ constructWithReplicateM asyncly thr buf
-        prop "wAsyncly replicateM" $ constructWithReplicateM wAsyncly thr buf
-        prop "parallely replicateM" $ constructWithReplicateM parallely thr buf
-        prop "aheadly replicateM" $ constructWithReplicateM aheadly thr buf
+constructionConcurrent :: Int -> Int -> Double -> Spec
+constructionConcurrent thr buf rate = do
+    describe (" threads = " ++ show thr
+           ++ "buffer = " ++ show buf
+           ++ " rate = " ++ show rate) $ do
+        prop "asyncly replicateM" $
+            constructWithReplicateM asyncly thr buf rate
+        prop "wAsyncly replicateM" $
+            constructWithReplicateM wAsyncly thr buf rate
+        prop "aheadly replicateM" $
+            constructWithReplicateM aheadly thr buf rate
+        -- thr/buf/rate should not have any impact on parallel streams
+        prop "parallely replicateM" $
+            constructWithReplicateM parallely 1 1 (0.0000001)
 
 -- XXX test all concurrent ops for all these combinations
-concurrentAll :: String -> (Int -> Int -> Spec) -> Spec
+concurrentAll :: String -> (Int -> Int -> Double -> Spec) -> Spec
 concurrentAll desc f = do
     describe desc $ do
-        f 0 0       -- default
-        f 0 1       -- single buffer
-        f 1 0       -- single thread
-        f (-1) (-1) -- unbounded threads and buffer
+        f 0 0 0     -- default
+        f 0 0 100   -- maxRate 100
+        f 0 1 0     -- single buffer
+        f 1 0 0     -- single thread
+        f (-1) (-1) (-1) -- unbounded threads and buffer
 
 main :: IO ()
 main = hspec $ do
@@ -627,7 +636,8 @@ main = hspec $ do
                 _ -> foldMapWith (<>) return xs
             )
     describe "Construction" $ do
-        prop "serially replicateM" $ constructWithReplicateM serially 0 0
+        prop "serially replicateM" $
+            constructWithReplicateM serially 1 1 0.000001
         it "iterate" $
             (S.toList . serially . (S.take 100) $ (S.iterate (+ 1) (0 :: Int)))
             `shouldReturn` (take 100 $ iterate (+ 1) 0)
