@@ -79,9 +79,9 @@ fromStreamVar sv = Stream $ \st stp sng yld -> do
             ChildYield a -> yld a rest
             ChildStop tid e -> do
                 -- XXX do we need this here?
-                case expectedYieldLatency sv of
+                case yieldRateInfo sv of
                     Nothing -> return ()
-                    Just _ -> liftIO (collectLatency sv) >> return ()
+                    Just info -> liftIO (collectLatency info) >> return ()
                 accountThread sv tid
                 case e of
                     Nothing -> unStream rest (rstState st) stp sng yld

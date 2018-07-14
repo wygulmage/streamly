@@ -49,7 +49,6 @@ import Data.Concurrent.Queue.MichaelScott (LinkedQueue, newQ, nullQ, tryPopR)
 import Data.IORef (IORef, newIORef, readIORef)
 import Data.Maybe (fromJust)
 import Data.Semigroup (Semigroup(..))
-import System.Clock
 
 import Prelude hiding (map)
 import qualified Data.Set as S
@@ -145,78 +144,53 @@ getLifoSVar st = do
     active  <- newIORef 0
     wfw     <- newIORef False
     running <- newIORef S.empty
-    q <- newIORef []
-    yl <- case yieldLimit st of
-            Nothing -> return Nothing
-            Just x -> Just <$> newIORef (fromIntegral x)
-    let pacedMode = maxStreamRate st > 0
-    (latency, measured, wcur, wcol, wlong) <-
-        if pacedMode
-        then do
-            let latency = round $ 1.0e9 / (maxStreamRate st)
-            measured <- newIORef 0
-            wcur     <- newIORef (0, 0)
-            wcol     <- newIORef (0, 0)
-            now      <- getTime Monotonic
-            wlong    <- newIORef (0, now)
-            return ( Just latency
-                   , Just measured
-                   , Just wcur
-                   , Just wcol
-                   , Just wlong)
-        else return (Nothing, Nothing, Nothing, Nothing, Nothing)
-    period   <- newIORef 1
-    stopTime <- newIORef $ fromNanoSecs 0
+    q       <- newIORef []
+    yl      <- case yieldLimit st of
+                Nothing -> return Nothing
+                Just x -> Just <$> newIORef (fromIntegral x)
+    rateInfo <- getYieldRateInfo st
 
 #ifdef DIAGNOSTICS
-    disp <- newIORef 0
+    disp   <- newIORef 0
     maxWrk <- newIORef 0
     maxOq  <- newIORef 0
     maxHs  <- newIORef 0
     maxWq  <- newIORef 0
 #endif
     let checkEmpty = null <$> readIORef q
-    let sv =
-            SVar { outputQueue      = outQ
-                 , maxYieldLimit    = yl
-                 , maxBufferLimit   = bufferHigh st
-                 , maxWorkerLimit   = threadsHigh st
-                 , expectedYieldLatency = latency
-                 , workerBootstrapLatency =
-                        Just $ fromIntegral $ workerLatency st
-                 , workerLatencyPeriod = period
-                 , workerMeasuredLatency = measured
-                 , workerCurrentLatency = wcur
-                 , workerStopTimeStamp = stopTime
-                 , workerCollectedLatency = wcol
-                 , workerLongTermLatency = wlong
-                 , outputDoorBell   = outQMv
-                 , readOutputQ      =
-                        if pacedMode
-                        then readOutputQPaced (threadsHigh st) sv
-                        else readOutputQBounded (threadsHigh st) sv
-                 , postProcess      =
-                        if pacedMode
-                        then postProcessPaced sv
-                        else postProcessBounded sv
-                 , workerThreads    = running
-                 , workLoop         = workLoopLIFO q st{streamVar = Just sv} sv
-                 , enqueue          = enqueueLIFO sv q
-                 , isWorkDone       = checkEmpty
-                 , needDoorBell     = wfw
-                 , svarStyle        = AsyncVar
-                 , workerCount      = active
-                 , accountThread    = delThread sv
+
+    let getSVar sv readOutput postProc = SVar
+            { outputQueue      = outQ
+            , maxYieldLimit    = yl
+            , maxBufferLimit   = bufferHigh st
+            , maxWorkerLimit   = threadsHigh st
+            , yieldRateInfo    = rateInfo
+            , outputDoorBell   = outQMv
+            , readOutputQ      = readOutput (threadsHigh st) sv
+            , postProcess      = postProc sv
+            , workerThreads    = running
+            , workLoop         = workLoopLIFO q st{streamVar = Just sv} sv
+            , enqueue          = enqueueLIFO sv q
+            , isWorkDone       = checkEmpty
+            , needDoorBell     = wfw
+            , svarStyle        = AsyncVar
+            , workerCount      = active
+            , accountThread    = delThread sv
 #ifdef DIAGNOSTICS
-                 , aheadWorkQueue   = undefined
-                 , outputHeap       = undefined
-                 , maxWorkers       = maxWrk
-                 , totalDispatches  = disp
-                 , maxOutQSize      = maxOq
-                 , maxHeapSize      = maxHs
-                 , maxWorkQSize     = maxWq
+            , aheadWorkQueue   = undefined
+            , outputHeap       = undefined
+            , maxWorkers       = maxWrk
+            , totalDispatches  = disp
+            , maxOutQSize      = maxOq
+            , maxHeapSize      = maxHs
+            , maxWorkQSize     = maxWq
 #endif
-                 }
+            }
+
+    let sv =
+            if isRateControlMode st
+            then getSVar sv readOutputQPaced postProcessPaced
+            else getSVar sv readOutputQBounded postProcessBounded
      in return sv
 
 getFifoSVar :: MonadAsync m => State Stream m a -> IO (SVar Stream m a)
@@ -227,27 +201,10 @@ getFifoSVar st = do
     wfw     <- newIORef False
     running <- newIORef S.empty
     q       <- newQ
-    yl <- case yieldLimit st of
-            Nothing -> return Nothing
-            Just x -> Just <$> newIORef (fromIntegral x)
-    let pacedMode = maxStreamRate st > 0
-    (latency, measured, wcur, wcol, wlong) <-
-        if pacedMode
-        then do
-            let latency = round $ 1.0e9 / (maxStreamRate st)
-            measured <- newIORef 0
-            wcur     <- newIORef (0,0)
-            wcol     <- newIORef (0,0)
-            now      <- getTime Monotonic
-            wlong    <- newIORef (0,now)
-            return ( Just latency
-                   , Just measured
-                   , Just wcur
-                   , Just wcol
-                   , Just wlong)
-        else return (Nothing, Nothing, Nothing, Nothing, Nothing)
-    period   <- newIORef 1
-    stopTime <- newIORef $ fromNanoSecs 0
+    yl      <- case yieldLimit st of
+                Nothing -> return Nothing
+                Just x -> Just <$> newIORef (fromIntegral x)
+    rateInfo <- getYieldRateInfo st
 
 #ifdef DIAGNOSTICS
     disp <- newIORef 0
@@ -256,47 +213,39 @@ getFifoSVar st = do
     maxHs  <- newIORef 0
     maxWq  <- newIORef 0
 #endif
-    let sv =
-           SVar { outputQueue      = outQ
-                , maxYieldLimit    = yl
-                , maxBufferLimit   = bufferHigh st
-                , maxWorkerLimit   = threadsHigh st
-                , expectedYieldLatency = latency
-                , workerBootstrapLatency =
-                        Just $ fromIntegral $ workerLatency st
-                , workerLatencyPeriod = period
-                , workerMeasuredLatency = measured
-                , workerCurrentLatency = wcur
-                , workerStopTimeStamp = stopTime
-                , workerCollectedLatency = wcol
-                , workerLongTermLatency = wlong
-                , outputDoorBell   = outQMv
-                , readOutputQ      =
-                        if pacedMode
-                        then readOutputQPaced (threadsHigh st) sv
-                        else readOutputQBounded (threadsHigh st) sv
-                , postProcess      =
-                        if pacedMode
-                        then postProcessPaced sv
-                        else postProcessBounded sv
-                , workerThreads    = running
-                , workLoop         = workLoopFIFO q st{streamVar = Just sv} sv
-                , enqueue          = enqueueFIFO sv q
-                , isWorkDone       = nullQ q
-                , needDoorBell     = wfw
-                , svarStyle        = WAsyncVar
-                , workerCount      = active
-                , accountThread    = delThread sv
+
+    let getSVar sv readOutput postProc = SVar
+            { outputQueue      = outQ
+            , maxYieldLimit    = yl
+            , maxBufferLimit   = bufferHigh st
+            , maxWorkerLimit   = threadsHigh st
+            , yieldRateInfo    = rateInfo
+            , outputDoorBell   = outQMv
+            , readOutputQ      = readOutput (threadsHigh st) sv
+            , postProcess      = postProc sv
+            , workerThreads    = running
+            , workLoop         = workLoopFIFO q st{streamVar = Just sv} sv
+            , enqueue          = enqueueFIFO sv q
+            , isWorkDone       = nullQ q
+            , needDoorBell     = wfw
+            , svarStyle        = WAsyncVar
+            , workerCount      = active
+            , accountThread    = delThread sv
 #ifdef DIAGNOSTICS
-                , aheadWorkQueue   = undefined
-                , outputHeap       = undefined
-                , totalDispatches  = disp
-                , maxWorkers       = maxWrk
-                , maxOutQSize      = maxOq
-                , maxHeapSize      = maxHs
-                , maxWorkQSize     = maxWq
+            , aheadWorkQueue   = undefined
+            , outputHeap       = undefined
+            , totalDispatches  = disp
+            , maxWorkers       = maxWrk
+            , maxOutQSize      = maxOq
+            , maxHeapSize      = maxHs
+            , maxWorkQSize     = maxWq
 #endif
-                 }
+             }
+
+    let sv =
+            if isRateControlMode st
+            then getSVar sv readOutputQPaced postProcessPaced
+            else getSVar sv readOutputQBounded postProcessBounded
      in return sv
 
 {-# INLINABLE newAsyncVar #-}
