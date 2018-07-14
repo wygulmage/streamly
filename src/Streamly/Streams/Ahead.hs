@@ -125,7 +125,6 @@ workLoopAhead q heap st sv winfo = runHeap
 
     where
 
-    -- sv = fromJust $ streamVar st
     maxBuf = maxBufferLimit sv
     toHeap seqNo ent = do
         hp <- liftIO $ atomicModifyIORefCAS heap $ \(h, snum) ->
@@ -135,7 +134,8 @@ workLoopAhead q heap st sv winfo = runHeap
         limit <- case maxYieldLimit sv of
             Nothing -> return maxHeap
             Just ref -> do
-                r <- liftIO $ readIORef ref
+                -- XXX make the heap count 64-bit?
+                r <- fmap fromIntegral $ liftIO $ readIORef ref
                 return $ if r >= 0 then r else maxHeap
         if H.size hp <= limit
         then runHeap

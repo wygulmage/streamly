@@ -34,8 +34,7 @@ where
 
 import Control.Monad.Catch (throwM)
 import Control.Monad.IO.Class (liftIO)
-import Data.IORef (readIORef, writeIORef)
-import Data.Maybe (fromJust)
+import Data.Int (Int64)
 
 import Streamly.SVar
 import Streamly.Streams.StreamK
@@ -79,7 +78,7 @@ fromStreamVar sv = Stream $ \st stp sng yld -> do
         case ev of
             ChildYield a -> yld a rest
             ChildStop tid e -> do
-                -- liftIO $ putStrLn $ "childstop"
+                -- XXX do we need this here?
                 case expectedYieldLatency sv of
                     Nothing -> return ()
                     Just _ -> liftIO (collectLatency sv) >> return ()
@@ -167,13 +166,13 @@ maxRateSerial _ = id
 -- cases.
 --
 {-# INLINE_NORMAL serialLatency #-}
-serialLatency :: IsStream t => Int -> t m a -> t m a
+serialLatency :: IsStream t => Int64 -> t m a -> t m a
 serialLatency n m = fromStream $ Stream $ \st stp sng yld -> do
     let n' = if n == 0 then defaultWorkerLatency else n
     unStream (toStream m) (st {workerLatency = n'}) stp sng yld
 
 {-# RULES "serialLatency serial" serialLatency = serialLatencySerial #-}
-serialLatencySerial :: Int -> SerialT m a -> SerialT m a
+serialLatencySerial :: Int64 -> SerialT m a -> SerialT m a
 serialLatencySerial _ = id
 
 -- Stop concurrent dispatches after this limit. This is useful in API's like
@@ -181,10 +180,10 @@ serialLatencySerial _ = id
 -- needs.  This value applies only to the immediate next level and is not
 -- inherited by everything in enclosed scope.
 {-# INLINE_NORMAL maxYields #-}
-maxYields :: IsStream t => Maybe Int -> t m a -> t m a
+maxYields :: IsStream t => Maybe Int64 -> t m a -> t m a
 maxYields n m = fromStream $ Stream $ \st stp sng yld -> do
     unStream (toStream m) (st {yieldLimit = n}) stp sng yld
 
 {-# RULES "maxYields serial" maxYields = maxYieldsSerial #-}
-maxYieldsSerial :: Maybe Int -> SerialT m a -> SerialT m a
+maxYieldsSerial :: Maybe Int64 -> SerialT m a -> SerialT m a
 maxYieldsSerial _ = id

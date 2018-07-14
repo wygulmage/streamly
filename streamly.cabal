@@ -377,6 +377,7 @@ benchmark base
     -- concurrency
     , atomic-primops    >= 0.8   && < 0.9
     , lockfree-queue    >= 0.2.3 && < 0.3
+    , clock             >= 0.7.1 && < 0.8
 
     , exceptions        >= 0.8   && < 0.11
     , monad-control     >= 1.0   && < 2

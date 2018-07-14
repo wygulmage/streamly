@@ -67,8 +67,13 @@ import qualified Streamly.Streams.StreamK as K
 -------------------------------------------------------------------------------
 
 {-# INLINE workLoopLIFO #-}
-workLoopLIFO :: MonadIO m
-    => IORef [Stream m a] -> State Stream m a -> SVar Stream m a -> WorkerInfo -> m ()
+workLoopLIFO
+    :: MonadIO m
+    => IORef [Stream m a]
+    -> State Stream m a
+    -> SVar Stream m a
+    -> WorkerInfo
+    -> m ()
 workLoopLIFO q st sv winfo = run
 
     where
@@ -143,20 +148,24 @@ getLifoSVar st = do
     q <- newIORef []
     yl <- case yieldLimit st of
             Nothing -> return Nothing
-            Just x -> Just <$> newIORef x
+            Just x -> Just <$> newIORef (fromIntegral x)
     let pacedMode = maxStreamRate st > 0
     (latency, measured, wcur, wcol, wlong) <-
         if pacedMode
         then do
             let latency = round $ 1.0e9 / (maxStreamRate st)
             measured <- newIORef 0
-            wcur <- newIORef (0,0)
-            wcol <- newIORef (0,0)
-            now <- getTime Monotonic
-            wlong <- newIORef (0,now)
-            return (Just latency, Just measured, Just wcur, Just wcol, Just wlong)
+            wcur     <- newIORef (0, 0)
+            wcol     <- newIORef (0, 0)
+            now      <- getTime Monotonic
+            wlong    <- newIORef (0, now)
+            return ( Just latency
+                   , Just measured
+                   , Just wcur
+                   , Just wcol
+                   , Just wlong)
         else return (Nothing, Nothing, Nothing, Nothing, Nothing)
-    period <- newIORef 1
+    period   <- newIORef 1
     stopTime <- newIORef $ fromNanoSecs 0
 
 #ifdef DIAGNOSTICS
@@ -171,8 +180,10 @@ getLifoSVar st = do
             SVar { outputQueue      = outQ
                  , maxYieldLimit    = yl
                  , maxBufferLimit   = bufferHigh st
+                 , maxWorkerLimit   = threadsHigh st
                  , expectedYieldLatency = latency
-                 , workerBootstrapLatency = Just $ workerLatency st
+                 , workerBootstrapLatency =
+                        Just $ fromIntegral $ workerLatency st
                  , workerLatencyPeriod = period
                  , workerMeasuredLatency = measured
                  , workerCurrentLatency = wcur
@@ -189,9 +200,6 @@ getLifoSVar st = do
                         then postProcessPaced sv
                         else postProcessBounded sv
                  , workerThreads    = running
-                 -- , workLoop         = workLoopLIFO runStreamLIFO
-                                         -- st{streamVar = Just sv} q
-                 --, workLoop         = workLoopLIFO runStreamLIFO q st{streamVar = Just sv} sv
                  , workLoop         = workLoopLIFO q st{streamVar = Just sv} sv
                  , enqueue          = enqueueLIFO sv q
                  , isWorkDone       = checkEmpty
@@ -221,20 +229,24 @@ getFifoSVar st = do
     q       <- newQ
     yl <- case yieldLimit st of
             Nothing -> return Nothing
-            Just x -> Just <$> newIORef x
+            Just x -> Just <$> newIORef (fromIntegral x)
     let pacedMode = maxStreamRate st > 0
     (latency, measured, wcur, wcol, wlong) <-
         if pacedMode
         then do
             let latency = round $ 1.0e9 / (maxStreamRate st)
             measured <- newIORef 0
-            wcur <- newIORef (0,0)
-            wcol <- newIORef (0,0)
-            now <- getTime Monotonic
-            wlong <- newIORef (0,now)
-            return (Just latency, Just measured, Just wcur, Just wcol, Just wlong)
+            wcur     <- newIORef (0,0)
+            wcol     <- newIORef (0,0)
+            now      <- getTime Monotonic
+            wlong    <- newIORef (0,now)
+            return ( Just latency
+                   , Just measured
+                   , Just wcur
+                   , Just wcol
+                   , Just wlong)
         else return (Nothing, Nothing, Nothing, Nothing, Nothing)
-    period <- newIORef 1
+    period   <- newIORef 1
     stopTime <- newIORef $ fromNanoSecs 0
 
 #ifdef DIAGNOSTICS
@@ -248,8 +260,10 @@ getFifoSVar st = do
            SVar { outputQueue      = outQ
                 , maxYieldLimit    = yl
                 , maxBufferLimit   = bufferHigh st
+                , maxWorkerLimit   = threadsHigh st
                 , expectedYieldLatency = latency
-                , workerBootstrapLatency = Just $ workerLatency st
+                , workerBootstrapLatency =
+                        Just $ fromIntegral $ workerLatency st
                 , workerLatencyPeriod = period
                 , workerMeasuredLatency = measured
                 , workerCurrentLatency = wcur
