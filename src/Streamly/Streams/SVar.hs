@@ -126,7 +126,11 @@ maxThreadsSerial _ = id
 -- concurrent computations. If the buffer becomes full we stop spawning more
 -- concurrent tasks until there is space in the buffer.
 -- A value of 0 resets the buffer size to default, a negative value means
--- there is no limit. The default value is 1500.
+-- there is no limit. The default value is 1500. CAUTION! using an unbounded
+-- 'maxBuffer' value (i.e. negative value) is a recipe for disaster in presence
+-- of infinite streams or very large streams. Especially, it must not be used
+-- with 'ZipAsyncM' streams when using 'pure' as the 'pure' implementaiton of
+-- applicative zip streams generates an infinite stream.
 --
 -- @since 0.4.0
 {-# INLINE_NORMAL maxBuffer #-}
