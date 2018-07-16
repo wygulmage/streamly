@@ -126,11 +126,13 @@ maxThreadsSerial _ = id
 -- concurrent computations. If the buffer becomes full we stop spawning more
 -- concurrent tasks until there is space in the buffer.
 -- A value of 0 resets the buffer size to default, a negative value means
--- there is no limit. The default value is 1500. CAUTION! using an unbounded
--- 'maxBuffer' value (i.e. negative value) is a recipe for disaster in presence
--- of infinite streams or very large streams. Especially, it must not be used
--- with 'ZipAsyncM' streams when using 'pure' as the 'pure' implementaiton of
--- applicative zip streams generates an infinite stream.
+-- there is no limit. The default value is 1500.
+--
+-- CAUTION! using an unbounded 'maxBuffer' value (i.e. a negative value) is a
+-- recipe for disaster in presence of infinite streams or very large streams.
+-- Especially, it must not be used with 'ZipAsyncM' streams when using 'pure'
+-- as the 'pure' implementaiton of applicative zip streams generates an
+-- infinite stream.
 --
 -- @since 0.4.0
 {-# INLINE_NORMAL maxBuffer #-}
@@ -146,7 +148,7 @@ maxBufferSerial _ = id
 -- stream can be generated. A value of 0 resets the rate to default, a negative
 -- value means there is no limit. The default value is no limit.
 --
--- @since 0.4.0
+-- @since 0.5.0
 {-# INLINE_NORMAL maxRate #-}
 maxRate :: IsStream t => Double -> t m a -> t m a
 maxRate n m = fromStream $ Stream $ \st stp sng yld -> do

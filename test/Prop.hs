@@ -31,12 +31,6 @@ maxTestCount = 100
 maxTestCount = 10
 #endif
 
-#ifdef WITH_MAX_RATE
-withMaxRate = maxRate
-#else
-withMaxRate = id
-#endif
-
 singleton :: IsStream t => a -> t m a
 singleton a = a .: nil
 
