@@ -1,3 +1,9 @@
+## Unreleased
+
+### Enhancements
+
+* Added `maxRate` combinator to control the yield rate of a stream.
+
 ## 0.4.1
 
 ### Bug Fixes

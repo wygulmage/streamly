@@ -145,9 +145,9 @@ getLifoSVar st = do
     wfw     <- newIORef False
     running <- newIORef S.empty
     q       <- newIORef []
-    yl      <- case yieldLimit st of
+    yl      <- case getYieldLimit st of
                 Nothing -> return Nothing
-                Just x -> Just <$> newIORef (fromIntegral x)
+                Just x -> Just <$> newIORef x
     rateInfo <- getYieldRateInfo st
 
 #ifdef DIAGNOSTICS
@@ -162,11 +162,11 @@ getLifoSVar st = do
     let getSVar sv readOutput postProc = SVar
             { outputQueue      = outQ
             , maxYieldLimit    = yl
-            , maxBufferLimit   = bufferHigh st
-            , maxWorkerLimit   = threadsHigh st
+            , maxBufferLimit   = getMaxBuffer st
+            , maxWorkerLimit   = getMaxThreads st
             , yieldRateInfo    = rateInfo
             , outputDoorBell   = outQMv
-            , readOutputQ      = readOutput (threadsHigh st) sv
+            , readOutputQ      = readOutput sv
             , postProcess      = postProc sv
             , workerThreads    = running
             , workLoop         = workLoopLIFO q st{streamVar = Just sv} sv
@@ -188,9 +188,9 @@ getLifoSVar st = do
             }
 
     let sv =
-            if isRateControlMode st
-            then getSVar sv readOutputQPaced postProcessPaced
-            else getSVar sv readOutputQBounded postProcessBounded
+            case getMaxStreamRate st of
+                Nothing -> getSVar sv readOutputQBounded postProcessBounded
+                Just _  -> getSVar sv readOutputQPaced postProcessPaced
      in return sv
 
 getFifoSVar :: MonadAsync m => State Stream m a -> IO (SVar Stream m a)
@@ -201,9 +201,9 @@ getFifoSVar st = do
     wfw     <- newIORef False
     running <- newIORef S.empty
     q       <- newQ
-    yl      <- case yieldLimit st of
+    yl      <- case getYieldLimit st of
                 Nothing -> return Nothing
-                Just x -> Just <$> newIORef (fromIntegral x)
+                Just x -> Just <$> newIORef x
     rateInfo <- getYieldRateInfo st
 
 #ifdef DIAGNOSTICS
@@ -217,11 +217,11 @@ getFifoSVar st = do
     let getSVar sv readOutput postProc = SVar
             { outputQueue      = outQ
             , maxYieldLimit    = yl
-            , maxBufferLimit   = bufferHigh st
-            , maxWorkerLimit   = threadsHigh st
+            , maxBufferLimit   = getMaxBuffer st
+            , maxWorkerLimit   = getMaxThreads st
             , yieldRateInfo    = rateInfo
             , outputDoorBell   = outQMv
-            , readOutputQ      = readOutput (threadsHigh st) sv
+            , readOutputQ      = readOutput sv
             , postProcess      = postProc sv
             , workerThreads    = running
             , workLoop         = workLoopFIFO q st{streamVar = Just sv} sv
@@ -243,9 +243,9 @@ getFifoSVar st = do
              }
 
     let sv =
-            if isRateControlMode st
-            then getSVar sv readOutputQPaced postProcessPaced
-            else getSVar sv readOutputQBounded postProcessBounded
+            case getMaxStreamRate st of
+                Nothing -> getSVar sv readOutputQBounded postProcessBounded
+                Just _  -> getSVar sv readOutputQPaced postProcessPaced
      in return sv
 
 {-# INLINABLE newAsyncVar #-}

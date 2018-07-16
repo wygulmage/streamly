@@ -108,14 +108,15 @@ toSVar sv m = toStreamVar sv (toStream m)
 -- not the grand total number of threads but maximum threads at each point of
 -- concurrency.
 -- A value of 0 resets the thread limit to default, a negative value means
--- there is no limit. The default value is 1500.
+-- there is no limit. The default value is 1500. 'maxThreads' cannot be set to
+-- more than 'maxBuffer', if so it is clipped to the current 'maxBuffer' limit
+-- in effect without warning.
 --
 -- @since 0.4.0
 {-# INLINE_NORMAL maxThreads #-}
 maxThreads :: IsStream t => Int -> t m a -> t m a
 maxThreads n m = fromStream $ Stream $ \st stp sng yld -> do
-    let n' = if n == 0 then defaultMaxThreads else n
-    unStream (toStream m) (st {threadsHigh = n'}) stp sng yld
+    unStream (toStream m) (setMaxThreads n st) stp sng yld
 
 {-# RULES "maxThreadsSerial serial" maxThreads = maxThreadsSerial #-}
 maxThreadsSerial :: Int -> SerialT m a -> SerialT m a
@@ -131,8 +132,7 @@ maxThreadsSerial _ = id
 {-# INLINE_NORMAL maxBuffer #-}
 maxBuffer :: IsStream t => Int -> t m a -> t m a
 maxBuffer n m = fromStream $ Stream $ \st stp sng yld -> do
-    let n' = if n == 0 then defaultMaxBuffer else n
-    unStream (toStream m) (st {bufferHigh = n'}) stp sng yld
+    unStream (toStream m) (setMaxBuffer n st) stp sng yld
 
 {-# RULES "maxBuffer serial" maxBuffer = maxBufferSerial #-}
 maxBufferSerial :: Int -> SerialT m a -> SerialT m a
@@ -146,8 +146,7 @@ maxBufferSerial _ = id
 {-# INLINE_NORMAL maxRate #-}
 maxRate :: IsStream t => Double -> t m a -> t m a
 maxRate n m = fromStream $ Stream $ \st stp sng yld -> do
-    let n' = if n == 0 then defaultMaxRate else n
-    unStream (toStream m) (st {maxStreamRate = n'}) stp sng yld
+    unStream (toStream m) (setMaxStreamRate n st) stp sng yld
 
 {-# RULES "maxRate serial" maxRate = maxRateSerial #-}
 maxRateSerial :: Double -> SerialT m a -> SerialT m a
@@ -166,13 +165,12 @@ maxRateSerial _ = id
 -- cases.
 --
 {-# INLINE_NORMAL serialLatency #-}
-serialLatency :: IsStream t => Int64 -> t m a -> t m a
+serialLatency :: IsStream t => Int -> t m a -> t m a
 serialLatency n m = fromStream $ Stream $ \st stp sng yld -> do
-    let n' = if n == 0 then defaultWorkerLatency else n
-    unStream (toStream m) (st {workerLatency = n'}) stp sng yld
+    unStream (toStream m) (setStreamLatency n st) stp sng yld
 
 {-# RULES "serialLatency serial" serialLatency = serialLatencySerial #-}
-serialLatencySerial :: Int64 -> SerialT m a -> SerialT m a
+serialLatencySerial :: Int -> SerialT m a -> SerialT m a
 serialLatencySerial _ = id
 
 -- Stop concurrent dispatches after this limit. This is useful in API's like
@@ -182,7 +180,7 @@ serialLatencySerial _ = id
 {-# INLINE_NORMAL maxYields #-}
 maxYields :: IsStream t => Maybe Int64 -> t m a -> t m a
 maxYields n m = fromStream $ Stream $ \st stp sng yld -> do
-    unStream (toStream m) (st {yieldLimit = n}) stp sng yld
+    unStream (toStream m) (setYieldLimit n st) stp sng yld
 
 {-# RULES "maxYields serial" maxYields = maxYieldsSerial #-}
 maxYieldsSerial :: Maybe Int64 -> SerialT m a -> SerialT m a

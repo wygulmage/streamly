@@ -126,10 +126,15 @@ workLoopAhead q heap st sv winfo = runHeap
     where
 
     maxBuf = maxBufferLimit sv
+    -- XXX rate control, should we record the worker stop time when we yield to
+    -- heap?  How would the waiting time in the heap impact the rate
+    -- calculations?
     toHeap seqNo ent = do
         hp <- liftIO $ atomicModifyIORefCAS heap $ \(h, snum) ->
             ((H.insert (Entry seqNo ent) h, snum), h)
         (_, len) <- liftIO $ readIORef (outputQueue sv)
+        -- Note, this may be negative when maxBuf is negative
+        -- which means there is no limit
         let maxHeap = maxBuf - len
         limit <- case maxYieldLimit sv of
             Nothing -> return maxHeap
@@ -137,9 +142,13 @@ workLoopAhead q heap st sv winfo = runHeap
                 -- XXX make the heap count 64-bit?
                 r <- fmap fromIntegral $ liftIO $ readIORef ref
                 return $ if r >= 0 then r else maxHeap
-        if H.size hp <= limit
+        if limit < 0
         then runHeap
-        else liftIO $ sendStop sv winfo
+        else do
+            active <- liftIO $ readIORef (workerCount sv)
+            if H.size hp + active <= limit
+            then runHeap
+            else liftIO $ sendStop sv winfo
 
     singleToHeap seqNo a = toHeap seqNo (AheadEntryPure a)
     yieldToHeap seqNo a r = toHeap seqNo (AheadEntryStream (a `K.cons` r))

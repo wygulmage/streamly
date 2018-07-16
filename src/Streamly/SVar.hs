@@ -24,13 +24,19 @@ module Streamly.SVar
       MonadAsync
     , SVar (..)
     , SVarStyle (..)
-    , defaultMaxBuffer
-    , defaultMaxThreads
-    , defaultMaxRate
-    , defaultWorkerLatency
-    , State (..)
+
+    , State (streamVar)
     , defState
     , rstState
+    , getMaxThreads
+    , setMaxThreads
+    , getMaxBuffer
+    , setMaxBuffer
+    , getMaxStreamRate
+    , setMaxStreamRate
+    , setStreamLatency
+    , getYieldLimit
+    , setYieldLimit
 
     , newAheadVar
     , newParallelVar
@@ -52,7 +58,6 @@ module Streamly.SVar
     , dequeueAhead
     , dequeueFromHeap
 
-    , isRateControlMode
     , getYieldRateInfo
     , collectLatency
     , postProcessBounded
@@ -215,7 +220,7 @@ data YieldRateInfo = YieldRateInfo
     -- XXX this is derivable from workerMeasuredLatency
     -- can be removed.
     , workerLatencyPeriod :: IORef Count
-    , workerBootstrapLatency :: NanoSecs
+    , workerBootstrapLatency :: Maybe NanoSecs
     -- measured latency over a long period of time used for making adjustments
     -- so that we can keep this close to the expected latency. Note that the
     -- consumer may be lazy or may take a lot of time in processing, we do not
@@ -278,40 +283,44 @@ data SVar t m a = SVar
 #endif
     }
 
+-------------------------------------------------------------------------------
+-- State for concurrency control
+-------------------------------------------------------------------------------
+
 -- XXX we can put the resettable fields in a oneShotConfig field and others in
 -- a persistentConfig field. That way reset would be fast and scalable
 -- irrespective of the number of fields.
 data State t m a = State
     { -- one shot configuration
       streamVar   :: Maybe (SVar t m a)
-    , yieldLimit  :: Maybe Int64
+    , _yieldLimit  :: Maybe Count
 
     -- persistent configuration
-    , threadsHigh :: Int
-    , bufferHigh  :: Int
-    , workerLatency  :: Int64
+    --  CAUTION! do not use threadsHigh to access this field, use getMaxThreads
+    --  instead, because it depends on bufferHigh as well.
+    , _threadsHigh    :: Int
+    , _bufferHigh     :: Int
+    , _streamLatency  :: Maybe NanoSecs
     -- yields per second
-    , maxStreamRate  :: Double
+    , _maxStreamRate  :: Maybe Double
     }
+
+-------------------------------------------------------------------------------
+-- State defaults and reset
+-------------------------------------------------------------------------------
 
 defaultMaxThreads, defaultMaxBuffer :: Int
 defaultMaxThreads = 1500
 defaultMaxBuffer = 1500
 
-defaultWorkerLatency :: Int64
-defaultWorkerLatency = -1
-
-defaultMaxRate :: Double
-defaultMaxRate = -1
-
 defState :: State t m a
 defState = State
     { streamVar = Nothing
-    , yieldLimit = Nothing
-    , threadsHigh = defaultMaxThreads
-    , bufferHigh = defaultMaxBuffer
-    , maxStreamRate = defaultMaxRate
-    , workerLatency = defaultWorkerLatency
+    , _yieldLimit = Nothing
+    , _threadsHigh = defaultMaxThreads
+    , _bufferHigh = defaultMaxBuffer
+    , _maxStreamRate = Nothing
+    , _streamLatency = Nothing
     }
 
 -- XXX if perf gets affected we can have all the Nothing params in a single
@@ -324,8 +333,90 @@ defState = State
 rstState :: State t m a -> State t m b
 rstState st = st
     { streamVar = Nothing
-    , yieldLimit = Nothing
+    , _yieldLimit = Nothing
     }
+
+-------------------------------------------------------------------------------
+-- Get/set routines for State
+-------------------------------------------------------------------------------
+
+-- Use get/set routines instead of directly accessing the State fields
+setYieldLimit :: Maybe Int64 -> State t m a -> State t m a
+setYieldLimit lim st =
+    st { _yieldLimit =
+            case lim of
+                Nothing -> Nothing
+                Just n  ->
+                    if n <= 0
+                    then Just 0
+                    else Just (fromIntegral n)
+       }
+
+getYieldLimit :: State t m a -> Maybe Count
+getYieldLimit = _yieldLimit
+
+setMaxThreads :: Int -> State t m a -> State t m a
+setMaxThreads n st =
+    st { _threadsHigh =
+            if n < 0
+            then -1
+            else if n == 0
+                 then defaultMaxThreads
+                 else n
+       }
+
+getMaxThreads :: State t m a -> Int
+getMaxThreads st =
+      assert ((_bufferHigh st) /= 0)
+    $ assert ((_threadsHigh st) /= 0)
+    $ if _bufferHigh st < 0
+        then _threadsHigh st
+        else if _threadsHigh st < 0
+             then _bufferHigh st
+             else min (_bufferHigh st) (_threadsHigh st)
+
+setMaxBuffer :: Int -> State t m a -> State t m a
+setMaxBuffer n st =
+    st { _bufferHigh =
+            if n < 0
+            then -1
+            else if n == 0
+                 then defaultMaxBuffer
+                 else n
+       }
+
+getMaxBuffer :: State t m a -> Int
+getMaxBuffer = _bufferHigh
+
+setMaxStreamRate :: Double -> State t m a -> State t m a
+setMaxStreamRate n st =
+    st { _maxStreamRate =
+            if n < 0
+            then Nothing
+            else if n == 0
+                 then Nothing
+                 else Just n
+       }
+
+getMaxStreamRate :: State t m a -> Maybe Double
+getMaxStreamRate = _maxStreamRate
+
+setStreamLatency :: Int -> State t m a -> State t m a
+setStreamLatency n st =
+    st { _streamLatency =
+            if n < 0
+            then Nothing
+            else if n == 0
+                 then Nothing
+                 else Just (fromIntegral n)
+       }
+
+getStreamLatency :: State t m a -> Maybe NanoSecs
+getStreamLatency = _streamLatency
+
+-------------------------------------------------------------------------------
+-- Dumping the SVar for debug/diag
+-------------------------------------------------------------------------------
 
 #ifdef DIAGNOSTICS
 {-# NOINLINE dumpSVar #-}
@@ -396,6 +487,10 @@ withDBGMVar :: SVar t m a -> String -> IO () -> IO ()
 withDBGMVar _ _ action = action
 #endif
 
+-------------------------------------------------------------------------------
+-- CAS
+-------------------------------------------------------------------------------
+
 -- Slightly faster version of CAS. Gained some improvement by avoiding the use
 -- of "evaluate" because we know we do not have exceptions in fn.
 {-# INLINE atomicModifyIORefCAS #-}
@@ -455,8 +550,8 @@ doFork action exHandler =
 
 -- | This function is used by the producer threads to queue output for the
 -- consumer thread to consume. Returns whether the queue has more space.
-send :: Int -> SVar t m a -> ChildEvent a -> IO Bool
-send maxOutputQLen sv msg = do
+send :: SVar t m a -> ChildEvent a -> IO Bool
+send sv msg = do
     len <- atomicModifyIORefCAS (outputQueue sv) $ \(es, n) ->
         ((msg : es, n + 1), n)
     when (len <= 0) $ do
@@ -470,7 +565,13 @@ send maxOutputQLen sv msg = do
         -- The important point is that the consumer is guaranteed to receive a
         -- doorbell if something was added to the queue after it empties it.
         void $ tryPutMVar (outputDoorBell sv) ()
-    return (len < maxOutputQLen || maxOutputQLen < 0)
+
+    let limit = maxBufferLimit sv
+    if limit <= 0
+    then return True
+    else do
+        active <- readIORef (workerCount sv)
+        return $ len < (limit - active)
 
 workerUpdateLatency :: YieldRateInfo -> WorkerInfo -> IO ()
 workerUpdateLatency yinfo winfo = do
@@ -509,7 +610,6 @@ workerRateControl sv yinfo winfo = do
 {-# INLINE sendYield #-}
 sendYield :: SVar t m a -> WorkerInfo -> ChildEvent a -> IO Bool
 sendYield sv winfo msg = do
-    let maxOutputQLen = maxBufferLimit sv
     ylimit <-
         case maxYieldLimit sv of
             Nothing -> return True
@@ -518,7 +618,7 @@ sendYield sv winfo msg = do
         case yieldRateInfo sv of
             Nothing -> return True
             Just info -> workerRateControl sv info winfo
-    r <- send maxOutputQLen sv msg
+    r <- send sv msg
     return $ r && ylimit && wylimit
 
 {-# INLINABLE sendStop #-}
@@ -533,7 +633,7 @@ sendStop sv winfo = do
             when (n == 1) $ do
                 t <- getTime Monotonic
                 writeIORef (workerStopTimeStamp info) t
-    myThreadId >>= \tid -> void $ send (-1) sv (ChildStop tid Nothing)
+    myThreadId >>= \tid -> void $ send sv (ChildStop tid Nothing)
 
 -------------------------------------------------------------------------------
 -- Async
@@ -760,7 +860,7 @@ allThreadsDone sv = liftIO $ S.null <$> readIORef (workerThreads sv)
 handleChildException :: SVar t m a -> SomeException -> IO ()
 handleChildException sv e = do
     tid <- myThreadId
-    void $ send (-1) sv (ChildStop tid (Just e))
+    void $ send sv (ChildStop tid (Just e))
 
 #ifdef DIAGNOSTICS
 recordMaxWorkers :: MonadIO m => SVar t m a -> m ()
@@ -813,8 +913,9 @@ pushWorkerPar sv wloop = do
 -- Returns:
 -- True: can dispatch more
 -- False: cannot dispatch any more
-dispatchWorker :: MonadAsync m => SVar t m a -> Int -> Count -> m Bool
-dispatchWorker sv workerLimit yieldCount = do
+dispatchWorker :: MonadAsync m => Count -> SVar t m a -> m Bool
+dispatchWorker yieldCount sv = do
+    let workerLimit = maxWorkerLimit sv
     done <- liftIO $ isWorkDone sv
     if (not done)
     then do
@@ -990,10 +1091,12 @@ adjustLatencies yinfo = do
 -- Returns:
 -- True: can dispatch more
 -- False: full, no more dispatches
-dispatchWorkerPaced :: MonadAsync m => Int -> SVar t m a -> m Bool
-dispatchWorkerPaced workerLimit sv = do
+dispatchWorkerPaced :: MonadAsync m => SVar t m a -> m Bool
+dispatchWorkerPaced sv = do
+    let workerLimit = maxWorkerLimit sv
     let yinfo = fromJust $ yieldRateInfo sv
     (count, tstamp, wLatency) <- liftIO $ collectLatency yinfo
+    -- XXX use workerBootstrapLatency
     if wLatency == 0
     -- Need to measure the latency with a single worker before we can perform
     -- any computation.
@@ -1015,13 +1118,13 @@ dispatchWorkerPaced workerLimit sv = do
             cnt <- liftIO $ readIORef $ workerCount sv
             when (cnt < 1) $ void $ do
                 n <- countDispatchYields (expectedLat - wLatency)
-                dispatchWorker sv workerLimit (fromIntegral (max n 1))
+                dispatchWorker (fromIntegral (max n 1)) sv
             return False
         else do
             -- XXX stagger the workers over a period
             cnt <- liftIO $ readIORef $ workerCount sv
             if (cnt < netWorkers)
-            then dispatchWorker sv workerLimit 0
+            then dispatchWorker 0 sv
             else return False
 
     where
@@ -1058,8 +1161,13 @@ sendWorkerDelay sv = do
         else threadDelay 10
 
 {-# NOINLINE sendWorkerWait #-}
-sendWorkerWait :: MonadAsync m => Int -> (SVar t m a -> IO ()) -> SVar t m a -> m ()
-sendWorkerWait workerLimit delay sv = do
+sendWorkerWait
+    :: MonadAsync m
+    => (SVar t m a -> IO ())
+    -> (SVar t m a -> m Bool)
+    -> SVar t m a
+    -> m ()
+sendWorkerWait delay dispatch sv = do
     -- Note that we are guaranteed to have at least one outstanding worker when
     -- we enter this function. So if we sleep we are guaranteed to be woken up
     -- by a outputDoorBell, when the worker exits.
@@ -1099,7 +1207,7 @@ sendWorkerWait workerLimit delay sv = do
 
         liftIO $ atomicModifyIORefCAS_ (needDoorBell sv) $ const True
         liftIO $ storeLoadBarrier
-        canDoMore <- dispatchWorker sv workerLimit 0
+        canDoMore <- dispatch sv
 
         -- XXX test for the case when we miss sending a worker when the worker
         -- count is more than 1500.
@@ -1109,12 +1217,12 @@ sendWorkerWait workerLimit delay sv = do
         -- forever.
 
         if canDoMore
-        then sendWorkerWait workerLimit delay sv
+        then sendWorkerWait delay dispatch sv
         else do
             liftIO $ withDBGMVar sv "sendWorkerWait: nothing to do"
                              $ takeMVar (outputDoorBell sv)
             (_, len) <- liftIO $ readIORef (outputQueue sv)
-            when (len <= 0) $ sendWorkerWait workerLimit delay sv
+            when (len <= 0) $ sendWorkerWait delay dispatch sv
 
 {-# INLINE readOutputQRaw #-}
 readOutputQRaw :: SVar t m a -> IO ([ChildEvent a], Int)
@@ -1126,8 +1234,8 @@ readOutputQRaw sv = do
 #endif
     return (list, len)
 
-readOutputQBounded :: MonadAsync m => Int -> SVar t m a -> m [ChildEvent a]
-readOutputQBounded workerLimit sv = do
+readOutputQBounded :: MonadAsync m => SVar t m a -> m [ChildEvent a]
+readOutputQBounded sv = do
     (list, len) <- liftIO $ readOutputQRaw sv
     -- When there is no output seen we dispatch more workers to help
     -- out if there is work pending in the work queue.
@@ -1151,11 +1259,11 @@ readOutputQBounded workerLimit sv = do
 
     {-# INLINE blockingRead #-}
     blockingRead = do
-        sendWorkerWait workerLimit sendWorkerDelay sv
+        sendWorkerWait sendWorkerDelay (dispatchWorker 0) sv
         liftIO $ (readOutputQRaw sv >>= return . fst)
 
-readOutputQPaced :: MonadAsync m => Int -> SVar t m a -> m [ChildEvent a]
-readOutputQPaced workerLimit sv = do
+readOutputQPaced :: MonadAsync m => SVar t m a -> m [ChildEvent a]
+readOutputQPaced sv = do
     (list, len) <- liftIO $ readOutputQRaw sv
     if len <= 0
     then blockingRead
@@ -1169,7 +1277,7 @@ readOutputQPaced workerLimit sv = do
 
     {-# INLINE blockingRead #-}
     blockingRead = do
-        sendWorkerWait workerLimit sendWorkerDelayPaced sv
+        sendWorkerWait sendWorkerDelayPaced dispatchWorkerPaced sv
         liftIO $ (readOutputQRaw sv >>= return . fst)
 
 postProcessBounded :: MonadAsync m => SVar t m a -> m Bool
@@ -1183,7 +1291,7 @@ postProcessBounded sv = do
         r <- liftIO $ isWorkDone sv
         -- XXX do we need to dispatch many here?
         when (not r) $ pushWorker 0 sv
-        -- void $ dispatchWorkerPaced (maxWorkerLimit sv) sv
+        -- void $ dispatchWorker (maxWorkerLimit sv) sv
         return r
     else return False
 
@@ -1199,37 +1307,34 @@ postProcessPaced sv = do
         when (not r) $ do
             let yinfo = fromJust $ yieldRateInfo sv
             liftIO $ adjustLatencies yinfo
-            void $ dispatchWorkerPaced 1 sv
+            void $ dispatchWorkerPaced sv
         return r
     else return False
 
-isRateControlMode :: State t m a -> Bool
-isRateControlMode st = maxStreamRate st > 0
-
 getYieldRateInfo :: State t m a -> IO (Maybe YieldRateInfo)
 getYieldRateInfo st = do
-    if isRateControlMode st
-    then do
-        let latency = round $ 1.0e9 / (maxStreamRate st)
-        measured <- newIORef 0
-        wcur     <- newIORef (0,0)
-        wcol     <- newIORef (0,0)
-        now      <- getTime Monotonic
-        wlong    <- newIORef (0,now)
-        period   <- newIORef 1
-        stopTime <- newIORef $ fromNanoSecs 0
+    case getMaxStreamRate st of
+        Just rate -> do
+            let latency = round $ 1.0e9 / rate
+            measured <- newIORef 0
+            wcur     <- newIORef (0,0)
+            wcol     <- newIORef (0,0)
+            now      <- getTime Monotonic
+            wlong    <- newIORef (0,now)
+            period   <- newIORef 1
+            stopTime <- newIORef $ fromNanoSecs 0
 
-        return $ Just YieldRateInfo
-            { expectedYieldLatency   = latency
-            , workerBootstrapLatency = fromIntegral $ workerLatency st
-            , workerLatencyPeriod    = period
-            , workerMeasuredLatency  = measured
-            , workerCurrentLatency   = wcur
-            , workerStopTimeStamp    = stopTime
-            , workerCollectedLatency = wcol
-            , workerLongTermLatency  = wlong
-            }
-    else return Nothing
+            return $ Just YieldRateInfo
+                { expectedYieldLatency   = latency
+                , workerBootstrapLatency = getStreamLatency st
+                , workerLatencyPeriod    = period
+                , workerMeasuredLatency  = measured
+                , workerCurrentLatency   = wcur
+                , workerStopTimeStamp    = stopTime
+                , workerCollectedLatency = wcol
+                , workerLongTermLatency  = wlong
+                }
+        Nothing -> return Nothing
 
 getAheadSVar :: MonadAsync m
     => State t m a
@@ -1248,9 +1353,9 @@ getAheadSVar st f = do
     wfw     <- newIORef False
     running <- newIORef S.empty
     q <- newIORef ([], -1)
-    yl <- case yieldLimit st of
+    yl <- case getYieldLimit st of
             Nothing -> return Nothing
-            Just x -> Just <$> newIORef (fromIntegral x)
+            Just x -> Just <$> newIORef x
     rateInfo <- getYieldRateInfo st
 
 #ifdef DIAGNOSTICS
@@ -1264,11 +1369,11 @@ getAheadSVar st f = do
     let getSVar sv readOutput postProc = SVar
             { outputQueue      = outQ
             , maxYieldLimit    = yl
-            , maxBufferLimit   = bufferHigh st
-            , maxWorkerLimit   = threadsHigh st
+            , maxBufferLimit   = getMaxBuffer st
+            , maxWorkerLimit   = getMaxThreads st
             , yieldRateInfo    = rateInfo
             , outputDoorBell   = outQMv
-            , readOutputQ      = readOutput (threadsHigh st) sv
+            , readOutputQ      = readOutput sv
             , postProcess      = postProc sv
             , workerThreads    = running
             , workLoop         = f q outH st{streamVar = Just sv} sv
@@ -1290,9 +1395,9 @@ getAheadSVar st f = do
             }
 
     let sv =
-            if isRateControlMode st
-            then getSVar sv readOutputQPaced postProcessPaced
-            else getSVar sv readOutputQBounded postProcessBounded
+            case getMaxStreamRate st of
+                Nothing -> getSVar sv readOutputQBounded postProcessBounded
+                Just _  -> getSVar sv readOutputQPaced postProcessPaced
      in return sv
 
     where
