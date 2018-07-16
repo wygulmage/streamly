@@ -242,6 +242,21 @@ test-suite properties
     , hspec             >= 2.0   && < 3
   default-language: Haskell2010
 
+test-suite maxrate
+  type: exitcode-stdio-1.0
+  default-language: Haskell2010
+  main-is: MaxRate.hs
+  hs-source-dirs:  test
+  if flag(dev)
+    buildable: True
+    build-Depends:
+          streamly
+        , base  >= 4.8   && < 5
+        , clock >= 0.7.1 && < 0.8
+        , hspec             >= 2.0   && < 3
+  else
+    buildable: False
+
 test-suite loops
   type: exitcode-stdio-1.0
   default-language: Haskell2010
