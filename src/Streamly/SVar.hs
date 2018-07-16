@@ -25,6 +25,7 @@ module Streamly.SVar
     , SVar (..)
     , SVarStyle (..)
 
+    , Limit (..)
     , State (streamVar)
     , defState
     , rstState
@@ -244,6 +245,8 @@ data YieldRateInfo = YieldRateInfo
     , workerStopTimeStamp    :: IORef TimeSpec
     }
 
+data Limit = Unlimited | Limited Word
+
 data SVar t m a = SVar
     {
     -- Read only state
@@ -256,8 +259,8 @@ data SVar t m a = SVar
     , postProcess    :: m Bool
 
     -- Combined/aggregate parameters
-    , maxWorkerLimit :: Int
-    , maxBufferLimit :: Int
+    , maxWorkerLimit :: Limit
+    , maxBufferLimit :: Limit
     , maxYieldLimit  :: Maybe (IORef Count)
     , yieldRateInfo  :: Maybe YieldRateInfo
 
@@ -290,16 +293,16 @@ data SVar t m a = SVar
 -- XXX we can put the resettable fields in a oneShotConfig field and others in
 -- a persistentConfig field. That way reset would be fast and scalable
 -- irrespective of the number of fields.
+--
+-- XXX make all these Limited types and use phantom types to distinguish them
 data State t m a = State
     { -- one shot configuration
       streamVar   :: Maybe (SVar t m a)
     , _yieldLimit  :: Maybe Count
 
     -- persistent configuration
-    --  CAUTION! do not use threadsHigh to access this field, use getMaxThreads
-    --  instead, because it depends on bufferHigh as well.
-    , _threadsHigh    :: Int
-    , _bufferHigh     :: Int
+    , _threadsHigh    :: Limit
+    , _bufferHigh     :: Limit
     , _streamLatency  :: Maybe NanoSecs
     -- yields per second
     , _maxStreamRate  :: Maybe Double
@@ -309,9 +312,12 @@ data State t m a = State
 -- State defaults and reset
 -------------------------------------------------------------------------------
 
-defaultMaxThreads, defaultMaxBuffer :: Int
-defaultMaxThreads = 1500
-defaultMaxBuffer = 1500
+magicMaxBuffer :: Word
+magicMaxBuffer = 1500
+
+defaultMaxThreads, defaultMaxBuffer :: Limit
+defaultMaxThreads = Limited magicMaxBuffer
+defaultMaxBuffer = Limited magicMaxBuffer
 
 defState :: State t m a
 defState = State
@@ -359,33 +365,26 @@ setMaxThreads :: Int -> State t m a -> State t m a
 setMaxThreads n st =
     st { _threadsHigh =
             if n < 0
-            then -1
+            then Unlimited
             else if n == 0
                  then defaultMaxThreads
-                 else n
+                 else Limited (fromIntegral n)
        }
 
-getMaxThreads :: State t m a -> Int
-getMaxThreads st =
-      assert ((_bufferHigh st) /= 0)
-    $ assert ((_threadsHigh st) /= 0)
-    $ if _bufferHigh st < 0
-        then _threadsHigh st
-        else if _threadsHigh st < 0
-             then _bufferHigh st
-             else min (_bufferHigh st) (_threadsHigh st)
+getMaxThreads :: State t m a -> Limit
+getMaxThreads = _threadsHigh
 
 setMaxBuffer :: Int -> State t m a -> State t m a
 setMaxBuffer n st =
     st { _bufferHigh =
             if n < 0
-            then -1
+            then Unlimited
             else if n == 0
                  then defaultMaxBuffer
-                 else n
+                 else Limited (fromIntegral n)
        }
 
-getMaxBuffer :: State t m a -> Int
+getMaxBuffer :: State t m a -> Limit
 getMaxBuffer = _bufferHigh
 
 setMaxStreamRate :: Double -> State t m a -> State t m a
@@ -567,11 +566,11 @@ send sv msg = do
         void $ tryPutMVar (outputDoorBell sv) ()
 
     let limit = maxBufferLimit sv
-    if limit <= 0
-    then return True
-    else do
-        active <- readIORef (workerCount sv)
-        return $ len < (limit - active)
+    case limit of
+        Unlimited -> return True
+        Limited lim -> do
+            active <- readIORef (workerCount sv)
+            return $ len < ((fromIntegral lim) - active)
 
 workerUpdateLatency :: YieldRateInfo -> WorkerInfo -> IO ()
 workerUpdateLatency yinfo winfo = do
@@ -922,25 +921,26 @@ dispatchWorker yieldCount sv = do
         -- Note that the worker count is only decremented during event
         -- processing in fromStreamVar and therefore it is safe to read and
         -- use it without a lock.
-        cnt <- liftIO $ readIORef $ workerCount sv
+        active <- liftIO $ readIORef $ workerCount sv
         -- Note that we may deadlock if the previous workers (tasks in the
         -- stream) wait/depend on the future workers (tasks in the stream)
         -- executing. In that case we should either configure the maxWorker
         -- count to higher or use parallel style instead of ahead or async
         -- style.
         limit <- case maxYieldLimit sv of
-            Nothing -> return (fromIntegral workerLimit)
+            Nothing -> return workerLimit
             Just x -> do
-                lim <- liftIO $ readIORef x
+                n <- liftIO $ readIORef x
                 return $
-                    if workerLimit > 0
-                    then min (fromIntegral workerLimit) lim
-                    else lim
-        if (fromIntegral cnt < limit || limit < 0)
-        then do
-            pushWorker yieldCount sv
-            return True
-        else return False
+                    case workerLimit of
+                        Unlimited -> Limited (fromIntegral n)
+                        Limited lim -> Limited $ min lim (fromIntegral n)
+
+        let dispatch = pushWorker yieldCount sv >> return True
+         in case limit of
+            Unlimited -> dispatch
+            Limited lim | active < (fromIntegral lim) -> dispatch
+            _ -> return False
     else return False
 
 minThreadDelay :: NanoSecs
@@ -949,10 +949,10 @@ minThreadDelay = 10^(6 :: Int)
 nanoToMicroSecs :: NanoSecs -> Int
 nanoToMicroSecs s = (fromIntegral s) `div` 1000
 
+-- XXX we can use phantom types to distinguish the duration/latency/expectedLat
 countDispatchWorkers
-    :: MonadIO m
-    => Int -> Count -> NanoSecs -> NanoSecs -> NanoSecs -> m Int
-countDispatchWorkers workerLimit count duration wLatency expectedLat = do
+    :: Limit -> Count -> NanoSecs -> NanoSecs -> NanoSecs -> Int
+countDispatchWorkers workerLimit count duration wLatency expectedLat =
     -- Calculate how many workers do we need to maintain the rate.
 
     -- XXX Increasing the workers may reduce the overall latency per
@@ -979,8 +979,10 @@ countDispatchWorkers workerLimit count duration wLatency expectedLat = do
         n = max 1 (1000 / fromIntegral wLatency) :: Double
         extraYields = (d / e) - (fromIntegral count)
         extraWorkers = extraYields / n
-        netWorkers = min (round $ nWorkers + extraWorkers) workerLimit
-    return netWorkers
+        requiredWorkers = round $ nWorkers + extraWorkers
+    in case workerLimit of
+        Unlimited -> requiredWorkers
+        Limited x -> min (round $ nWorkers + extraWorkers) (fromIntegral x)
 
 -- | Get the worker latency without resetting workerCurrentLatency
 -- Returns (total yield count, base time, measured latency)
@@ -1012,8 +1014,8 @@ workerShouldStop sv yinfo = do
     now <- getTime Monotonic
     let duration = fromInteger $ toNanoSecs $ now - tstamp
     let expectedLat = expectedYieldLatency yinfo
-    netWorkers <- countDispatchWorkers (maxWorkerLimit sv) count duration
-                                       wLatency expectedLat
+    let netWorkers = countDispatchWorkers (maxWorkerLimit sv) count duration
+                                          wLatency expectedLat
     cnt <- readIORef $ workerCount sv
     if netWorkers <= 0
     then do
@@ -1032,8 +1034,8 @@ useCollectedBatch :: YieldRateInfo
                   -> IO ()
 useCollectedBatch yinfo latency colRef measRef = do
     let periodRef = workerLatencyPeriod yinfo
-        period    = max 1 (min (minThreadDelay `div` latency)
-                               (fromIntegral defaultMaxBuffer))
+        cnt = max 1 $ minThreadDelay `div` latency
+        period = min cnt (fromIntegral magicMaxBuffer)
 
     writeIORef periodRef (fromIntegral period)
     writeIORef colRef (0, 0)
@@ -1066,7 +1068,7 @@ collectLatency yinfo = do
     then do
         let new = pendingTime `div` (fromIntegral pendingCount)
         -- To avoid minor fluctuations update in batches
-        if     (pendingCount > (fromIntegral defaultMaxBuffer))
+        if     (pendingCount > fromIntegral magicMaxBuffer)
             || (pendingTime > minThreadDelay)
             || (let r = (fromIntegral new) / (fromIntegral prev) :: Double
                  in prev > 0 && (r > 2 || r < 0.5))
@@ -1105,8 +1107,8 @@ dispatchWorkerPaced sv = do
         now <- liftIO $ getTime Monotonic
         let duration = fromInteger $ toNanoSecs $ now - tstamp
         let expectedLat = expectedYieldLatency yinfo
-        netWorkers <- countDispatchWorkers workerLimit count duration
-                                           wLatency expectedLat
+        let netWorkers = countDispatchWorkers workerLimit count duration
+                                              wLatency expectedLat
 
         if netWorkers <= 0
         then do
@@ -1117,8 +1119,8 @@ dispatchWorkerPaced sv = do
 
             cnt <- liftIO $ readIORef $ workerCount sv
             when (cnt < 1) $ void $ do
-                n <- countDispatchYields (expectedLat - wLatency)
-                dispatchWorker (fromIntegral (max n 1)) sv
+                let n = countDispatchYields (expectedLat - wLatency)
+                 in dispatchWorker (fromIntegral (max n 1)) sv
             return False
         else do
             -- XXX stagger the workers over a period
@@ -1129,18 +1131,19 @@ dispatchWorkerPaced sv = do
 
     where
 
-    countDispatchYields idleTime = do
-        assert (idleTime >= 0) (return ())
+    countDispatchYields :: NanoSecs -> Int
+    countDispatchYields idleTime =
+        assert (idleTime >= 0) $
         -- we do not want to sleep for less than minThreadDelay
-        let maxYieldsPerWorker = defaultMaxBuffer
-        if idleTime < minThreadDelay
-        then do
-            if idleTime == 0
-            then return maxYieldsPerWorker
-            else do
-                let n = (minThreadDelay + idleTime) `div` idleTime
-                return $ min (fromIntegral n) maxYieldsPerWorker
-        else return 1
+        let maxYieldsPerWorker = fromIntegral magicMaxBuffer
+         in if idleTime < minThreadDelay
+            then
+                if idleTime == 0
+                then maxYieldsPerWorker
+                else
+                    let n = (minThreadDelay + idleTime) `div` idleTime
+                     in min (fromIntegral n) maxYieldsPerWorker
+            else 1
 
 sendWorkerDelayPaced :: SVar t m a -> IO ()
 sendWorkerDelayPaced _ = return ()
@@ -1430,7 +1433,7 @@ getParallelSVar = do
     let sv =
             SVar { outputQueue      = outQ
                  , maxYieldLimit    = Nothing
-                 , maxBufferLimit   = -1
+                 , maxBufferLimit   = Unlimited
                  , maxWorkerLimit   = undefined
                  , yieldRateInfo    = Nothing
                  , outputDoorBell   = outQMv

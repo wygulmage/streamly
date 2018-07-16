@@ -133,22 +133,29 @@ workLoopAhead q heap st sv winfo = runHeap
         hp <- liftIO $ atomicModifyIORefCAS heap $ \(h, snum) ->
             ((H.insert (Entry seqNo ent) h, snum), h)
         (_, len) <- liftIO $ readIORef (outputQueue sv)
-        -- Note, this may be negative when maxBuf is negative
-        -- which means there is no limit
-        let maxHeap = maxBuf - len
+
+        -- XXX simplify this
+        let maxHeap = case maxBuf of
+                Limited lim -> Limited $
+                    if (fromIntegral lim) >= len
+                    then lim - (fromIntegral len)
+                    else 0
+                Unlimited -> Unlimited
+
         limit <- case maxYieldLimit sv of
             Nothing -> return maxHeap
             Just ref -> do
                 -- XXX make the heap count 64-bit?
-                r <- fmap fromIntegral $ liftIO $ readIORef ref
-                return $ if r >= 0 then r else maxHeap
-        if limit < 0
-        then runHeap
-        else do
-            active <- liftIO $ readIORef (workerCount sv)
-            if H.size hp + active <= limit
-            then runHeap
-            else liftIO $ sendStop sv winfo
+                r <- liftIO $ readIORef ref
+                return $ if r >= 0 then Limited (fromIntegral r) else maxHeap
+
+        case limit of
+            Limited lim -> do
+                active <- liftIO $ readIORef (workerCount sv)
+                if H.size hp + active <= (fromIntegral lim)
+                then runHeap
+                else liftIO $ sendStop sv winfo
+            Unlimited -> runHeap
 
     singleToHeap seqNo a = toHeap seqNo (AheadEntryPure a)
     yieldToHeap seqNo a r = toHeap seqNo (AheadEntryStream (a `K.cons` r))

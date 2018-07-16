@@ -103,14 +103,12 @@ toSVar sv m = toStreamVar sv (toStream m)
 -- XXX need to write these in direct style otherwise they will break fusion.
 --
 -- | Specify the maximum number of threads that can be spawned concurrently
--- when using concurrent streams. This values denotes maximum in-flight
+-- when using concurrent streams. This values denotes maximum concurrent
 -- requests or tasks in progress at any given point of time. Note that this is
--- not the grand total number of threads but maximum threads at each point of
--- concurrency.
+-- not the grand total number of threads but maximum threads at any given point
+-- of concurrency.
 -- A value of 0 resets the thread limit to default, a negative value means
--- there is no limit. The default value is 1500. 'maxThreads' cannot be set to
--- more than 'maxBuffer', if so it is clipped to the current 'maxBuffer' limit
--- in effect without warning.
+-- there is no limit. The default value is 1500.
 --
 -- @since 0.4.0
 {-# INLINE_NORMAL maxThreads #-}
