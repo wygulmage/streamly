@@ -31,6 +31,12 @@ maxTestCount = 100
 maxTestCount = 10
 #endif
 
+#ifdef WITH_MAX_RATE
+withMaxRate = maxRate
+#else
+withMaxRate = id
+#endif
+
 singleton :: IsStream t => a -> t m a
 singleton a = a .: nil
 
@@ -50,16 +56,12 @@ equals eq stream list = do
 constructWithReplicateM
     :: IsStream t
     => (t IO Int -> SerialT IO Int)
-    -> Int
-    -> Int
-    -> Double
     -> Word8
     -> Property
-constructWithReplicateM op thr buf rate len = withMaxSuccess maxTestCount $
+constructWithReplicateM op len = withMaxSuccess maxTestCount $
     monadicIO $ do
         let x = return (1 :: Int)
-        stream <- run $ (S.toList . op) (maxRate rate $ maxThreads thr $ maxBuffer buf $
-            S.replicateM (fromIntegral len) x)
+        stream <- run $ (S.toList . op) (S.replicateM (fromIntegral len) x)
         list <- run $ replicateM (fromIntegral len) x
         equals (==) stream list
 
@@ -602,21 +604,7 @@ monadBind constr t eq (a, b) = withMaxSuccess maxTestCount $
         let list = a >>= \x -> b >>= return . (+ x)
         equals eq stream list
 
-constructionConcurrent :: Int -> Int -> Double -> Spec
-constructionConcurrent thr buf rate = do
-    describe (" threads = " ++ show thr
-           ++ "buffer = " ++ show buf
-           ++ " rate = " ++ show rate) $ do
-        prop "asyncly replicateM" $
-            constructWithReplicateM asyncly thr buf rate
-        prop "wAsyncly replicateM" $
-            constructWithReplicateM wAsyncly thr buf rate
-        prop "aheadly replicateM" $
-            constructWithReplicateM aheadly thr buf rate
-        -- thr/buf/rate should not have any impact on parallel streams
-        prop "parallely replicateM" $
-            constructWithReplicateM parallely 1 1 (0.0000001)
-
+{-
 -- XXX test all concurrent ops for all these combinations
 concurrentAll :: String -> (Int -> Int -> Double -> Spec) -> Spec
 concurrentAll desc f = do
@@ -626,6 +614,17 @@ concurrentAll desc f = do
         f 0 1 0     -- single buffer
         f 1 0 0     -- single thread
         f (-1) (-1) (-1) -- unbounded threads and buffer
+        -}
+
+constructWithIterate :: IsStream t => (t IO Int -> SerialT IO Int) -> Spec
+constructWithIterate t = do
+    it "iterate" $
+        (S.toList . t . (S.take 100) $ (S.iterate (+ 1) (0 :: Int)))
+        `shouldReturn` (take 100 $ iterate (+ 1) 0)
+    it "iterateM" $ do
+        let addM = (\ y -> return (y + 1))
+        S.toList . t . (S.take 100) $ S.iterateM addM (0 :: Int)
+        `shouldReturn` (take 100 $ iterate (+ 1) 0)
 
 main :: IO ()
 main = hspec $ do
@@ -636,20 +635,16 @@ main = hspec $ do
                 _ -> foldMapWith (<>) return xs
             )
     describe "Construction" $ do
-        prop "serially replicateM" $
-            constructWithReplicateM serially 1 1 0.000001
-        it "iterate" $
-            (S.toList . serially . (S.take 100) $ (S.iterate (+ 1) (0 :: Int)))
-            `shouldReturn` (take 100 $ iterate (+ 1) 0)
+        prop "serially replicateM" $ constructWithReplicateM serially
+        prop "asyncly replicateM" $ constructWithReplicateM asyncly
+        prop "wAsyncly replicateM" $ constructWithReplicateM wAsyncly
+        prop "aheadly replicateM" $ constructWithReplicateM aheadly
+        prop "parallely replicateM" $ constructWithReplicateM parallely
         -- XXX test for all types of streams
-        it "iterateM" $ do
-            let addM = (\ y -> return (y + 1))
-            S.toList . serially . (S.take 100) $ S.iterateM addM (0 :: Int)
-            `shouldReturn` (take 100 $ iterate (+ 1) 0)
-    concurrentAll "Construction" constructionConcurrent
+        constructWithIterate serially
 
     describe "Functor operations" $ do
-        functorOps S.fromFoldable "serially" serially (==)
+        functorOps S.fromFoldable "serially" (serially . (maxRate 0.0001))  (==)
         functorOps folded "serially folded" serially (==)
         functorOps S.fromFoldable "wSerially" wSerially (==)
         functorOps folded "wSerially folded" wSerially (==)
@@ -781,6 +776,7 @@ main = hspec $ do
         concurrentOps folded "wAsyncly folded" wAsyncly sortEq
         concurrentOps folded "parallely folded" parallely sortEq
 
+    describe "Concurrent application" $ do
         prop "concurrent application" $ withMaxSuccess maxTestCount $
             concurrentApplication
         prop "concurrent foldr application" $ withMaxSuccess maxTestCount $
