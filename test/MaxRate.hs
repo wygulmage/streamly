@@ -2,15 +2,11 @@
 
 import Streamly
 import qualified Streamly.Prelude as S
-import Streamly.Prelude ((.:), nil, (|:))
 import Control.Concurrent
-import System.IO
-import Data.Foldable (fold)
-import Control.Monad.IO.Class
 import Control.Monad
-import Data.Function ((&))
 import System.Clock
 import Test.Hspec
+import System.Random
 
 durationShouldBe :: (Double, Double) -> IO () -> Expectation
 durationShouldBe d@(tMin, tMax) action = do
@@ -23,22 +19,26 @@ durationShouldBe d@(tMin, tMax) action = do
         putStrLn $ "Expected: " ++ show d ++ " Took: " ++ show t
         (t <= tMax && t >= tMin) `shouldBe` True
 
-measureRate :: (IsStream t, Num a)
+toMicroSecs :: Num a => a -> a
+toMicroSecs x = x * 10^(6 :: Int)
+
+measureRate' :: IsStream t
     => String
-    -> (t IO a -> SerialT IO a)
+    -> (t IO Int -> SerialT IO Int)
     -> Double
     -> Int
-    -> Int
+    -> (Double, Double)
     -> (Double, Double)
     -> Spec
-measureRate desc t rate consumerDelay producerDelay dur = do
+measureRate' desc t rate consumerDelay producerDelay dur = do
     it (desc ++ " rate: " ++ show rate
              ++ ", consumer latency: " ++ show consumerDelay
              ++ ", producer latency: " ++ show producerDelay)
     $ durationShouldBe dur $ do
         runStream
             $ (if consumerDelay > 0
-              then S.mapM (\x -> threadDelay (consumerDelay * 10^6) >> return x)
+              then S.mapM $ \x ->
+                        threadDelay (toMicroSecs consumerDelay) >> return x
               else id)
             $ t
             $ maxBuffer  (-1)
@@ -46,10 +46,25 @@ measureRate desc t rate consumerDelay producerDelay dur = do
             $ maxRate rate
             $ S.take  (round $ rate * 10)
             $ S.repeatM $ do
-                if producerDelay > 0
-                then threadDelay (producerDelay * 10^6)
-                else return ()
+                let (t1, t2) = producerDelay
+                r <- if t1 == t2
+                     then return $ round $ toMicroSecs t1
+                     else randomRIO ( round $ toMicroSecs t1
+                                    , round $ toMicroSecs t2)
+                when (r > 0) $ threadDelay r
                 return 1
+
+measureRate :: IsStream t
+    => String
+    -> (t IO Int -> SerialT IO Int)
+    -> Double
+    -> Int
+    -> Int
+    -> (Double, Double)
+    -> Spec
+measureRate desc t rate consumerDelay producerDelay dur =
+    let d = fromIntegral producerDelay
+    in measureRate' desc t rate consumerDelay (d, d) dur
 
 main :: IO ()
 main = hspec $ do
@@ -65,6 +80,11 @@ main = hspec $ do
     let rates = [1, 10, 100, 1000, 10000, 25000]
      in describe "asyncly no consumer delay and 1 sec producer delay" $ do
             forM_ rates (\r -> measureRate "asyncly" asyncly r 0 1 range)
+
+    let rates = [1, 10, 100, 1000, 10000, 25000]
+     in describe "asyncly no consumer delay and variable producer delay" $ do
+            forM_ rates $ \r ->
+                measureRate' "asyncly" asyncly r 0 (0.1, 3) range
 
     let rates = [1, 10, 100, 1000, 10000, 100000, 1000000]
      in describe "wAsyncly no consumer delay no producer delay" $ do
@@ -84,12 +104,12 @@ main = hspec $ do
      in describe "aheadly no consumer delay and 1 sec producer delay" $ do
             forM_ rates (\r -> measureRate "aheadly" aheadly r 0 1 range)
 
-    describe "asyncly with 1 sec producer delay and varying consumer delay" $ do
-        forM_ [1] (\r -> measureRate "asyncly" asyncly r 1 1 (14, 16))
+    describe "asyncly with 1 sec producer delay and some consumer delay" $ do
+        forM_ [1] (\r -> measureRate "asyncly" asyncly r 1 1 (11, 16))
         forM_ [1] (\r -> measureRate "asyncly" asyncly r 2 1 (21, 23))
         forM_ [1] (\r -> measureRate "asyncly" asyncly r 3 1 (31, 33))
 
-    describe "aheadly with 1 sec producer delay and varying consumer delay" $ do
+    describe "aheadly with 1 sec producer delay and some consumer delay" $ do
         forM_ [1] (\r -> measureRate "aheadly" aheadly r 1 1 (11, 16))
         forM_ [1] (\r -> measureRate "aheadly" aheadly r 2 1 (21, 23))
         forM_ [1] (\r -> measureRate "aheadly" aheadly r 3 1 (31, 33))
